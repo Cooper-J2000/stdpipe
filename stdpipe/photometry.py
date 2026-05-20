@@ -1078,6 +1078,11 @@ def get_objects_sep(
         if not np.isfinite(sig) or sig <= 0:
             raise ValueError("centroid_sigma_scale should produce a positive finite sigma")
         xwin, ywin, flag_win = sep.winpos(image1, obj0['x'], obj0['y'], sig, **winpos_kwargs)
+        # Drop sep.APER_HASMASKED: our segmap restriction (seg_id=-N) masks every
+        # pixel outside each source's footprint, so the winpos aperture always
+        # overlaps masked pixels by construction. Keep TRUNC / ALLMASKED /
+        # NONPOSITIVE — those still convey real centroiding-quality info.
+        flag_win &= ~np.int_(sep.APER_HASMASKED)
     else:
         # Use initial positions from extraction
         xwin, ywin = obj0['x'], obj0['y']
