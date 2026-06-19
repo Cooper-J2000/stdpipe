@@ -257,10 +257,48 @@ def _smooth_inpaint(flat, mask, scale, levels=(1, 2, 4, 8)):
     return out
 
 
+def _auto_scale(resid, mask_src, rms_med, candidates=(6, 8, 10, 12, 16, 20, 24),
+                noise_frac=0.25):
+    """Pick the smoothing scale automatically from the fringe-to-noise ratio.
+
+    For each candidate scale, a single mask-aware normalized smoothing pass
+    estimates the model. The variance of that model is the sum of a fringe
+    (signal) part and a predictable noise floor that the smoothing leaves
+    behind: smoothing white noise of per-pixel ``rms`` with a normalized
+    Gaussian of width ``s`` over an unmasked fraction ``f`` reduces it to
+    ``rms / (2 s sqrt(pi f))``. Subtracting that floor in quadrature gives
+    the fringe amplitude, and the smallest scale at which the noise floor
+    falls below ``noise_frac`` of it is chosen.
+
+    Strong, sharp fringes thus keep a small scale (little smoothing, good
+    fidelity); faint, broad fringes get a larger scale that averages the
+    noise down instead of leaking it into the model.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    data0 = np.where(mask_src, 0.0, resid)
+    support = (~mask_src).astype(np.float64)
+    f = max(support.mean(), 1e-3)
+
+    chosen = candidates[-1]
+    for s in candidates:
+        num = gaussian_filter(data0, s, mode='constant')
+        den = gaussian_filter(support, s, mode='constant')
+        est = num / np.maximum(den, 1e-10)
+        var = np.var(est[den > 0.3])
+        noise = rms_med / (2.0 * s * np.sqrt(np.pi * f))
+        signal = np.sqrt(max(var - noise**2, 0.0))
+        if noise < noise_frac * signal:
+            chosen = s
+            break
+    return float(chosen)
+
+
 def remove_fringes(
     image,
     mask=None,
-    scale=6.0,
+    scale='auto',
+    noise_frac=0.25,
     bg_size=256,
     threshold=2.0,
     dilate=2,
@@ -313,12 +351,22 @@ def remove_fringes(
         Input image
     mask : ndarray, optional
         Boolean mask (True = masked pixels to exclude from fringe estimation)
-    scale : float
+    scale : float or 'auto'
         Sigma of the Gaussian smoothing kernel in pixels. Should be of order
         the stellar FWHM or somewhat larger, and well below the narrowest
         fringe period. Smaller values track narrower fringes at the cost of
         slightly more noise and source flux absorbed into the map.
-        Default: 6
+        If ``'auto'`` (default), the scale is selected from the measured
+        fringe-to-noise ratio (6 px for strong, sharp fringes up to a few
+        tens of px for faint, broad ones), so that noise does not leak into
+        the fringe model. Pass a number to set it explicitly.
+    noise_frac : float
+        Aggressiveness of the automatic scale selection (used only when
+        ``scale='auto'``). The smallest scale whose predicted noise floor
+        falls below ``noise_frac`` times the fringe amplitude is chosen.
+        Smaller values give cleaner (less noisy) models but larger kernels,
+        which can over-smooth very faint, broad fringes; larger values keep
+        smaller kernels at the cost of more noise in the model. Default: 0.25
     bg_size : int or None
         Mesh size in pixels for the coarse sky background subtracted before
         fringe estimation. Should be much larger than the fringe scale.
@@ -419,6 +467,15 @@ def remove_fringes(
         log('Coarse background: global median, rms %.2f' % rms.flat[0])
 
     from scipy.ndimage import binary_dilation
+
+    # Auto-select the smoothing scale from the fringe-to-noise ratio so that
+    # faint, broad fringes get more noise averaging than sharp, strong ones
+    if isinstance(scale, str):
+        if scale != 'auto':
+            raise ValueError("scale must be a number or 'auto'")
+        scale = _auto_scale(resid, (np.abs(resid) > threshold * rms) | mask_bad,
+                            float(np.median(rms)), noise_frac=noise_frac)
+        log('Auto-selected smoothing scale: %.0f px' % scale)
 
     fringe_model = np.zeros_like(img)
     geos = None

@@ -31,8 +31,12 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('filename', help='Input FITS image')
-    parser.add_argument('--scale', type=float, default=6.0,
-                        help='Sigma of Gaussian smoothing kernel, pixels')
+    parser.add_argument('--scale', default='auto',
+                        help="Sigma of Gaussian smoothing kernel in pixels, or "
+                             "'auto' (default) to select it from the fringe-to-noise ratio")
+    parser.add_argument('--noise-frac', type=float, default=0.25,
+                        help="Aggressiveness of automatic scale selection (lower = "
+                             "cleaner but larger kernel). Only used with --scale auto")
     parser.add_argument('--bg-size', type=int, default=256,
                         help='Mesh size of the coarse sky background, pixels')
     parser.add_argument('--threshold', type=float, default=2.0,
@@ -73,7 +77,8 @@ def main():
     corrected, model = remove_fringes(
         image,
         mask=mask if np.any(mask) else None,
-        scale=args.scale,
+        scale=args.scale if args.scale == 'auto' else float(args.scale),
+        noise_frac=args.noise_frac,
         bg_size=args.bg_size,
         threshold=args.threshold,
         dilate=args.dilate,
@@ -125,8 +130,9 @@ def main():
 
     fig.suptitle(
         f"{os.path.basename(args.filename)} — "
-        f"scale={args.scale} bg_size={args.bg_size} threshold={args.threshold} "
-        f"dilate={args.dilate} iterations={args.iterations} halo_sn={args.halo_sn}",
+        f"scale={args.scale} noise_frac={args.noise_frac} bg_size={args.bg_size} "
+        f"threshold={args.threshold} dilate={args.dilate} "
+        f"iterations={args.iterations} halo_sn={args.halo_sn}",
         fontsize=10,
     )
     plt.tight_layout()

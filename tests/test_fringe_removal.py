@@ -88,6 +88,47 @@ def test_curved_fringes_removed(test_config, fringed_scene):
 
 
 @pytest.mark.unit
+def test_auto_scale_reduces_noise_for_faint_fringes(test_config, rng):
+    """For faint, broad fringes (low fringe-to-noise) the automatic scale
+    selection should pick a larger kernel than for sharp ones, leaving much
+    less noise in the model than the minimum scale would."""
+    from stdpipe.fringe_removal import _auto_scale
+    from astropy.convolution import Gaussian2DKernel, convolve_fft
+
+    size = 512
+    # Broad fringes (period 120) at a small fraction of the pixel noise
+    fringes = create_curved_fringes(size, 4.0, 120.0)
+    noise = rng.normal(0, 20.0, (size, size))
+    image = 100.0 + fringes + noise
+
+    s_auto = _auto_scale(image - 100.0, np.zeros((size, size), bool), 20.0)
+    assert s_auto > 6  # adapts upward for the faint/broad case
+
+    def noise_leak(model):
+        sm = convolve_fft(model, Gaussian2DKernel(4), normalize_kernel=True,
+                          allow_huge=True, boundary='wrap')
+        return np.std((model - sm)[32:-32, 32:-32])
+
+    _, model_min = remove_fringes(image, scale=6.0, get_fringe_model=True)
+    _, model_auto = remove_fringes(image, scale='auto', get_fringe_model=True)
+
+    print(f"\nAuto scale {s_auto:.0f}: noise leak "
+          f"{noise_leak(model_min):.2f} (scale=6) -> {noise_leak(model_auto):.2f} (auto)")
+    assert noise_leak(model_auto) < 0.6 * noise_leak(model_min)
+
+
+@pytest.mark.unit
+def test_auto_scale_keeps_small_scale_for_sharp_fringes(test_config, fringed_scene):
+    """Strong, sharp fringes should keep the minimum scale: auto must not
+    over-smooth them, so the result matches scale=6."""
+    from stdpipe.fringe_removal import _auto_scale
+
+    resid = fringed_scene['image'] - np.median(fringed_scene['image'])
+    s = _auto_scale(resid, np.zeros(resid.shape, bool), test_config['noise_std'])
+    assert s == 6
+
+
+@pytest.mark.unit
 def test_reconstruction_identity(test_config, fringed_scene):
     """corrected + model must reproduce the input exactly."""
     corrected, model = remove_fringes(
