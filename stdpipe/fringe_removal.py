@@ -835,6 +835,7 @@ def remove_fringes_fourier(
         If None, no high-frequency protection is applied.
     method : str
         Pattern removal method:
+
         - 'global': Detect and notch out power spectrum peaks (default)
         - 'bandpass': Suppress a whole frequency range given by period_range
     period_range : tuple
@@ -867,16 +868,11 @@ def remove_fringes_fourier(
 
     Examples
     --------
-    # Automatic peak detection and notching
-    corrected = remove_fringes_fourier(image, fwhm=3.0)
-
-    # Bandpass filtering for known period range
-    corrected = remove_fringes_fourier(
-        image,
-        method='bandpass',
-        period_range=(50, 150),
-        fwhm=3.0
-    )
+    >>> # Automatic peak detection and notching
+    >>> corrected = remove_fringes_fourier(image, fwhm=3.0)
+    >>> # Bandpass filtering for known period range
+    >>> corrected = remove_fringes_fourier(
+    ...     image, method='bandpass', period_range=(50, 150), fwhm=3.0)
     """
     # Setup logging
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
