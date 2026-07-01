@@ -63,6 +63,19 @@ catalogs = {
             'e_Kmag',
         ],
     },
+    '2mass': {
+        'vizier': 'II/246/out',
+        'name': '2MASS PSC',
+    },
+    'vhs': {
+        'vizier': 'II/367/vhs_dr5',
+        'name': 'Vista Hemisphere Survey DR5',
+        'extra': [
+            'e_Jap3',
+            'e_Hap3',
+            'e_Ksap3',
+        ]
+    },
 }
 
 
@@ -79,7 +92,7 @@ def _detect_catalog_type(cat):
     -------
     catalog_type : str or None
         Detected catalog type ('ps1', 'gaiadr2', 'skymapper', 'apass',
-        'gaiadr3syn', 'sdss') or None if cannot detect
+        'gaiadr3syn', 'sdss', '2mass', 'vhs') or None if cannot detect
     """
     colnames = set(cat.colnames)
 
@@ -111,6 +124,14 @@ def _detect_catalog_type(cat):
     # Cannot distinguish between them from columns alone (identical augmentation anyway)
     if {'gmag', 'rmag', 'imag', 'zmag', 'ymag'}.issubset(colnames):
         return 'ps1'  # Could be 'atlas' too, but augmentation is identical
+
+    # 2MASS
+    if {'Jmag', 'Hmag', 'Kmag'}.issubset(colnames):
+        return '2mass'
+
+    # VHS
+    if {'Jap3', 'Hap3', 'Ksap3'}.issubset(colnames):
+        return 'vhs'
 
     # Could not detect
     return None
@@ -556,6 +577,49 @@ def _augment_sdss(cat, verbose=False):
     except KeyError as e:
         log(f"Warning: Missing required column for SDSS augmentation: {e}")
 
+def _augment_2mass(cat, verbose=False):
+    """Augment 2MASS catalog with additional bands."""
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
+    try:
+        log("Renaming the catalogue K magnitudes to Ks ones")
+
+        cat['Ksmag'] = cat['Kmag']
+        cat['e_Ksmag'] = cat['e_Kmag']
+
+    except KeyError as e:
+        log(f"Warning: Missing required column for 2MASS augmentation: {e}")
+
+
+def _augment_vhs(cat, verbose=False):
+    """Augment VHS catalog with 2MASS-system JHKs magnitudes."""
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
+    try:
+        log("Augmenting the catalogue with 2MASS magnitudes")
+
+        for _ in ['J', 'H', 'Ks']:
+            cat[f"{_}mag"] = cat[f"{_}ap3"]
+            cat[f"e_{_}mag"] = cat[f"e_{_}ap3"]
+
+        def color_term(a, b, coeff):
+            # Color-term correction that degrades gracefully to zero (i.e. keeps the
+            # uncorrected VISTA magnitude) where the auxiliary band is missing, so that
+            # e.g. a field lacking H-band coverage does not wipe out the J magnitudes.
+            term = coeff * (np.ma.filled(cat[a].astype(float), np.nan)
+                            - np.ma.filled(cat[b].astype(float), np.nan))
+            n_bad = int(np.count_nonzero(np.isnan(term)))
+            if n_bad:
+                log(f"Warning: {n_bad}/{len(cat)} stars lack {a} or {b}; "
+                    f"their magnitudes are left uncorrected for the {a}-{b} colour term")
+            return np.nan_to_num(term, nan=0.0)
+
+        # VISTA to 2MASS equations from https://ui.adsabs.harvard.edu/abs/2013A%26A...552A.101S
+        cat['Jmag'] += color_term('Jap3', 'Hap3', 0.070)
+        cat['Hmag'] += color_term('Hap3', 'Ksap3', -0.035)
+        cat['Ksmag'] += color_term('Jap3', 'Ksap3', -0.011)
+
+    except KeyError as e:
+        log(f"Warning: Missing required column for VHS augmentation: {e}")
+
 
 def augment_cat_bands(cat, catalog=None, verbose=False):
     """
@@ -567,7 +631,7 @@ def augment_cat_bands(cat, catalog=None, verbose=False):
         Input catalog to augment. Modified in-place.
     catalog : str, optional
         Catalog type: 'ps1', 'atlas', 'gaiadr2', 'skymapper', 'apass',
-        'gaiadr3syn', 'sdss'. If None, auto-detect from columns.
+        'gaiadr3syn', 'sdss', '2mass', 'vhs'. If None, auto-detect from columns.
     verbose : bool or callable, optional
         Logging control.
 
@@ -600,6 +664,10 @@ def augment_cat_bands(cat, catalog=None, verbose=False):
         _augment_gaiadr3syn(cat, verbose=verbose)
     elif catalog == 'sdss':
         _augment_sdss(cat, verbose=verbose)
+    elif catalog == '2mass':
+        _augment_2mass(cat, verbose=verbose)
+    elif catalog == 'vhs':
+        _augment_vhs(cat, verbose=verbose)
     else:
         log(f"Warning: Unknown catalog type '{catalog}'. Skipping augmentation.")
 
@@ -634,6 +702,8 @@ def get_cat_vizier(
     - ``atlas`` — ATLAS-RefCat2, augmented with Johnson-Cousins B, V, R, I
     - ``usnob1`` — USNO-B1
     - ``gsc`` — Guide Star Catalogue 2.2
+    - ``2mass`` — 2MASS Point Source Catalogue
+    - ``vhs`` — VISTA Hemisphere Survey DR5, augmented with 2MASS-system J, H, Ks
 
     Parameters
     ----------

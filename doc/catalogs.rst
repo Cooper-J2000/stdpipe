@@ -11,6 +11,8 @@ For some of them we have a special support - we automatically augment them with 
 
 -  for Gaia DR2, we use some self-made conversion coefficients derived by cross-matching with Stetson standards, along with linearity correction described at https://www.cosmos.esa.int/web/gaia/dr2-known-issues#PhotometrySystematicEffectsAndResponseCurves
 
+-  for VHS (VISTA) to 2MASS-system :math:`J`, :math:`H`, :math:`K_s` magnitudes, we use the transformation equations from https://ui.adsabs.harvard.edu/abs/2013A%26A...552A.101S
+
 The following example shows how to get a reference catalogue for a given image
 
 .. code-block:: python
