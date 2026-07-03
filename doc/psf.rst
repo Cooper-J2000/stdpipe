@@ -196,7 +196,25 @@ magnitudes (`mag`, `magerr`), and quality metrics:
 - `npix_psf` - Number of unmasked pixels used in fit
 - `reduced_chi2_psf` - Reduced chi-squared (photutils >= 2.3.0)
 
+In addition, unless ``compute_quality=False``, crowdsource-style per-source
+quality metrics (Schlafly et al.) are computed from neighbour-subtracted
+residual stamps:
+
+- `qf` - PSF quality factor: fraction of the PSF footprint falling on unmasked pixels (1 = clean, lower when masked or off-edge)
+- `fracflux` - Fraction of PSF-weighted stamp flux belonging to this source after subtracting the fitted models of overlapping neighbours; a crowding/blendedness indicator (1 = isolated)
+- `spread_model` - SExtractor-like star/galaxy discriminant (~0 for point sources, > 0 for extended ones); directly comparable to the ``SPREAD_MODEL`` column produced by :func:`~stdpipe.photometry.get_objects_sextractor` when a PSF model is supplied
+- `dspread_model` - Uncertainty of `spread_model` (SExtractor's ``SPREADERR_MODEL``)
+
+Sources whose fit failed get NaN in these columns. The metrics are not
+computed in position-dependent PSF mode (``use_position_dependent_psf=True``)
+— the columns are then present but NaN. The underlying stamp-based routines
+live in :mod:`stdpipe.photometry_quality` and are backend-agnostic.
+
 .. autofunction:: stdpipe.photometry_psf.measure_objects_psf
+   :noindex:
+
+.. automodule:: stdpipe.photometry_quality
+   :members: compute_psf_quality, compute_qf, compute_fracflux, compute_spread_model
    :noindex:
 
 

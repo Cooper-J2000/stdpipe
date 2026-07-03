@@ -60,6 +60,129 @@ def _scale_psf_image_for_photutils(psf_image, oversampling):
     return psf_image * factor
 
 
+def _compute_psf_quality_columns(
+    phot_obj,
+    psf_model,
+    image1,
+    err,
+    mask_combined,
+    x_fit,
+    y_fit,
+    flux_fit,
+    fit_size,
+    fwhm,
+    log,
+):
+    """Build per-source residual stamps and compute crowdsource-style quality
+    metrics (``qf``, ``fracflux``, ``spread_model``, ``dspread_model``) from the
+    output of a successful :class:`photutils.psf.PSFPhotometry` run.
+
+    Returns a dict of length-``N`` arrays, or ``None`` if anything fails.
+    """
+    from . import photometry_quality as pq
+
+    N = len(x_fit)
+    if N == 0:
+        return None
+
+    H, W = image1.shape
+    half = int(fit_size) // 2
+    sz = 2 * half + 1  # ensure odd
+
+    # NB: the model image excludes the fitted local background, while the data
+    # stamps below still contain it when ``bkgann`` is used — any residual
+    # local background therefore leaks into ``fracflux`` / ``spread_model``.
+    try:
+        full_model = phot_obj.make_model_image(
+            image1.shape, psf_shape=(sz, sz), include_localbkg=False
+        )
+    except Exception as e:
+        log('Skipping PSF quality stats (model image build failed: %s)' % e)
+        return None
+
+    weight_full = np.zeros_like(image1, dtype='f4')
+    if err is not None:
+        finite = np.isfinite(err) & (err > 0)
+        weight_full[finite] = 1.0 / err[finite]
+    if mask_combined is not None:
+        weight_full[mask_combined.astype(bool)] = 0.0
+
+    impsf_stack = np.zeros((N, sz, sz), dtype='f4')
+    im_stack = np.zeros((N, sz, sz), dtype='f4')
+    psf_stack = np.zeros((N, sz, sz), dtype='f4')
+    weight_stack = np.zeros((N, sz, sz), dtype='f4')
+
+    x_fit = np.asarray(x_fit, dtype='f4')
+    y_fit = np.asarray(y_fit, dtype='f4')
+    flux_fit = np.asarray(flux_fit, dtype='f4')
+    valid = np.isfinite(x_fit) & np.isfinite(y_fit) & np.isfinite(flux_fit)
+    filled = np.zeros(N, dtype=bool)
+
+    for i in range(N):
+        if not valid[i]:
+            continue
+
+        cx = int(np.round(x_fit[i]))
+        cy = int(np.round(y_fit[i]))
+        x0, x1 = cx - half, cx + half + 1
+        y0, y1 = cy - half, cy + half + 1
+
+        sx0, sx1 = max(0, x0), min(W, x1)
+        sy0, sy1 = max(0, y0), min(H, y1)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+
+        lx0, lx1 = sx0 - x0, sx1 - x0
+        ly0, ly1 = sy0 - y0, sy1 - y0
+
+        yy = np.arange(sy0, sy1, dtype='f4').reshape(-1, 1)
+        xx = np.arange(sx0, sx1, dtype='f4').reshape(1, -1)
+
+        try:
+            m = psf_model.copy()
+            if hasattr(m, 'x_0'):
+                m.x_0 = float(x_fit[i])
+            if hasattr(m, 'y_0'):
+                m.y_0 = float(y_fit[i])
+            if hasattr(m, 'flux'):
+                m.flux = 1.0
+            psf_local = np.asarray(m(xx, yy), dtype='f4')
+        except Exception:
+            continue
+
+        single_local = psf_local * float(flux_fit[i])
+        data_local = image1[sy0:sy1, sx0:sx1].astype('f4')
+        model_local = full_model[sy0:sy1, sx0:sx1].astype('f4')
+
+        psf_stack[i, ly0:ly1, lx0:lx1] = psf_local
+        im_stack[i, ly0:ly1, lx0:lx1] = data_local
+        weight_stack[i, ly0:ly1, lx0:lx1] = weight_full[sy0:sy1, sx0:sx1]
+        # neighbour-subtracted = data - (full_model - this_source) = data - full_model + this_source
+        impsf_stack[i, ly0:ly1, lx0:lx1] = data_local - model_local + single_local
+        filled[i] = True
+
+    # Per-source FWHM (FWHMMap callable, scalar, or None)
+    if _is_callable_fwhm(fwhm):
+        fwhm_arr = np.asarray(fwhm(x_fit, y_fit), dtype='f4')
+    elif fwhm is not None:
+        fwhm_arr = float(fwhm)
+    else:
+        fwhm_arr = None
+
+    quality = pq.compute_psf_quality(
+        impsf_stack, im_stack, psf_stack, weight_stack, fwhm=fwhm_arr
+    )
+
+    # Sources without a stamp (failed fit, off-image, model evaluation error)
+    # would otherwise get zeros from their empty stamps — and spread_model == 0
+    # reads as a clean star. Report NaN for them instead.
+    for key in quality:
+        quality[key] = np.asarray(quality[key], dtype='f4')
+        quality[key][~filled] = np.nan
+
+    return quality
+
+
 def _build_circular_fit_mask(shape, x_positions, y_positions, radius):
     mask_fit = np.ones(shape, dtype=bool)
     r2 = radius**2
@@ -366,6 +489,7 @@ def measure_objects_psf(
     use_position_dependent_psf=False,
     group_sources=True,
     grouper_radius=None,
+    compute_quality=True,
     verbose=False,
 ):
     """PSF photometry at the positions of already detected objects using photutils.
@@ -400,7 +524,8 @@ def measure_objects_psf(
         or to estimate psf_size. If None, will be estimated from obj['fwhm'] if
         available. A position-dependent callable (e.g.
         :class:`stdpipe.photometry.FWHMMap`) is accepted: its scalar summary
-        (median) is used for PSF model construction and sizing.
+        (median) is used for PSF model construction and sizing, while the
+        per-source values are used for the PSF quality metrics.
     mask : `~numpy.ndarray` or None, optional
         Image mask as a boolean array (True values will be masked).
     bg : `~numpy.ndarray` or None, optional
@@ -449,6 +574,14 @@ def measure_objects_psf(
     grouper_radius : float or None, optional
         Radius in pixels for grouping nearby sources. If None, defaults to
         2*psf_size. Only used if group_sources is True.
+    compute_quality : bool, optional
+        If True (default), compute crowdsource-style per-source quality
+        metrics: ``qf`` (PSF quality factor), ``fracflux`` (fraction of
+        stamp flux explained by this source after subtracting the fitted
+        models of overlapping neighbours), ``spread_model`` and
+        ``dspread_model`` (SExtractor-like star/galaxy classifier and its
+        uncertainty). Adds a small overhead per source. Not implemented for
+        ``use_position_dependent_psf=True`` — the columns are then NaN.
     verbose : bool or callable, optional
         Whether to show verbose messages during the run. May be either boolean,
         or a ``print``-like function.
@@ -690,6 +823,15 @@ def measure_objects_psf(
         obj['flags_psf'] = 0
         obj['npix_psf'] = 0
         obj['reduced_chi2_psf'] = np.nan
+        if compute_quality:
+            # Quality metrics are not implemented for the per-source iterative
+            # mode (no joint model image to subtract neighbours from) — keep
+            # the output schema consistent with the standard path via NaNs.
+            log('PSF quality metrics are not computed in position-dependent mode')
+            obj['qf'] = np.nan
+            obj['fracflux'] = np.nan
+            obj['spread_model'] = np.nan
+            obj['dspread_model'] = np.nan
         if 'flags' not in obj.keys():
             obj['flags'] = 0
 
@@ -828,6 +970,11 @@ def measure_objects_psf(
         obj['flags_psf'] = 0
         obj['npix_psf'] = 0
         obj['reduced_chi2_psf'] = np.nan
+        if compute_quality:
+            obj['qf'] = np.nan
+            obj['fracflux'] = np.nan
+            obj['spread_model'] = np.nan
+            obj['dspread_model'] = np.nan
         if 'flags' not in obj.keys():
             obj['flags'] = 0
 
@@ -909,6 +1056,26 @@ def measure_objects_psf(
                         > 1.0
                     )
                     obj['flags'][moved_idx] |= 0x2000  # Large centroid shift
+
+                if compute_quality:
+                    quality = _compute_psf_quality_columns(
+                        phot_obj,
+                        psf_model,
+                        image1,
+                        err,
+                        mask_for_fit,
+                        np.asarray(obj['x_psf'])[valid_pos],
+                        np.asarray(obj['y_psf'])[valid_pos],
+                        np.asarray(obj['flux'])[valid_pos],
+                        fit_size,
+                        fwhm,
+                        log,
+                    )
+                    if quality is not None:
+                        obj['qf'][valid_pos] = quality['qf']
+                        obj['fracflux'][valid_pos] = quality['fracflux']
+                        obj['spread_model'][valid_pos] = quality['spread_model']
+                        obj['dspread_model'][valid_pos] = quality['dspread_model']
 
                 # Flag fits that didn't converge (photutils returns initial guess unchanged)
                 # Check for flags_psf bit 0 (convergence failure) or exact match with input

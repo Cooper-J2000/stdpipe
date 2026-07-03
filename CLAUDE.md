@@ -123,7 +123,7 @@ The codebase is organized into focused modules in `stdpipe/`:
   - `FWHMMap` - callable polynomial FWHM(x, y) (scalar via `float(fmap)`), usable anywhere a `fwhm` argument is accepted.
 - `photometry_measure.py` - **Aperture and optimal extraction photometry**. Main function: `measure_objects()` for photometry at detected object positions. Supports both standard aperture photometry and optimal extraction (Naylor 1998) that provides ~10% S/N improvement for point sources. **Advanced features**: grouped optimal extraction for crowded fields (simultaneously fits overlapping sources via weighted least squares). Handles background estimation, error propagation, centroiding, and local background annuli. Both `measure_objects` and `measure_objects_sep` accept a callable `fwhm` (e.g. `FWHMMap`): the SEP backend broadcasts per-source aperture/bkgann/fwhm arrays to SEP; the photutils backend uses per-source width in ungrouped optimal extraction and falls back to the scalar median elsewhere.
 - `photometry_model.py` - **Photometric modeling and calibration**. Main functions: `match()` for photometric matching with spatial zero-point models, `make_sn_model()` for S/N modeling, `get_detection_limit_sn()` for detection limit estimation. Core calibration routines used by higher-level workflows.
-- `photometry_psf.py` - **PSF photometry** using photutils. Main functions: `measure_objects_psf()` for PSF fitting photometry, `create_psf_model()` for building empirical ePSF. Provides more accurate flux measurements than aperture photometry, especially in crowded fields. Supports Gaussian, PSFEx, and empirical PSF models. **Advanced features**: position-dependent PSF (evaluates PSFEx polynomials at each position) and grouped PSF fitting (simultaneously fits overlapping sources).
+- `photometry_psf.py` - **PSF photometry** using photutils. Main functions: `measure_objects_psf()` for PSF fitting photometry, `create_psf_model()` for building empirical ePSF. Provides more accurate flux measurements than aperture photometry, especially in crowded fields. Supports Gaussian, PSFEx, and empirical PSF models. **Advanced features**: position-dependent PSF (evaluates PSFEx polynomials at each position), grouped PSF fitting (simultaneously fits overlapping sources), and crowdsource-style quality metrics (`qf`, `fracflux`, `spread_model`, `dspread_model`; `compute_quality=True` by default, NaN in position-dependent mode). Stamp-based metric routines live in `photometry_quality.py` (backend-agnostic).
 - `photometry_iraf.py` - **IRAF DAOPHOT backend** for aperture and PSF photometry. Main functions: `measure_objects()` for aperture photometry using DAOPHOT phot task, `measure_objects_psf()` for PSF photometry using complete DAOPHOT workflow (phot → psf → allstar). Requires PyRAF/IRAF. Provides classic, battle-tested algorithms as alternative to photutils.
 - `astrometry.py` - Astrometric calibration and coordinate transformations. Wraps Astrometry.Net for blind solving, SCAMP for refinement. Utilities for WCS, pixel scales, spherical distances
 - `subtraction.py` - Image subtraction wrappers. Main functions: `run_sfft()` (built-in SFFT), `run_hotpants()` (external HOTPANTS), `run_zogy()` (built-in ZOGY). All share the same interface pattern (masks, error maps, gain, `get_noise`/`get_scaled`/`get_convolved`)
@@ -249,6 +249,13 @@ Both approaches:
 - `flags_psf` - Photutils fit flags
 - `npix_psf` - Number of unmasked pixels used in fit
 - `reduced_chi2_psf` - Reduced chi-squared (photutils ≥ 2.3.0)
+
+**PSF Quality Metrics (photutils backend, `compute_quality=True` by default, no suffix):**
+- `qf` - PSF quality factor: fraction of PSF footprint on unmasked pixels (1 = clean)
+- `fracflux` - Fraction of PSF-weighted stamp flux from this source after neighbour subtraction (crowding indicator, 1 = isolated)
+- `spread_model` - Star/galaxy discriminant (~0 for stars, > 0 for extended); matches SExtractor's `SPREAD_MODEL`
+- `dspread_model` - Uncertainty of `spread_model`
+Crowdsource-style (Schlafly et al.), computed in `photometry_quality.py` from neighbour-subtracted residual stamps. NaN for failed fits and in position-dependent PSF mode.
 
 **Advanced PSF Features:**
 - **Position-dependent PSF** (`use_position_dependent_psf=True`) - For wide-field imaging where PSF varies across the field. Evaluates PSFEx polynomial at each source position (constant, linear, quadratic terms). Slower but more accurate for fields with PSF variation.
