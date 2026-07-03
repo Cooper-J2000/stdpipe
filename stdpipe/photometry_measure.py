@@ -26,11 +26,7 @@ except ImportError:
 
 def _is_callable_fwhm(fwhm):
     """True if ``fwhm`` is a position-dependent callable (e.g. FWHMMap)."""
-    return (
-        fwhm is not None
-        and callable(fwhm)
-        and not isinstance(fwhm, (bool, int, float, np.integer, np.floating))
-    )
+    return callable(fwhm)
 
 
 def _fwhm_scalar(fwhm):
@@ -55,12 +51,27 @@ def _fwhm_at(fwhm, x, y):
     Returns a scalar for numeric ``fwhm``, an array for callable ``fwhm``,
     and ``None`` when ``fwhm`` is missing or non-positive.
     """
-    s = _fwhm_scalar(fwhm)
-    if s is None:
-        return None
     if _is_callable_fwhm(fwhm):
         return np.asarray(fwhm(x, y), dtype=float)
-    return s
+    return _fwhm_scalar(fwhm)
+
+
+def _fwhm_median(fwhm, image_shape=None):
+    """Scalar summary of a FWHM specification (numeric or callable).
+
+    Uses ``float(fwhm)`` when available (e.g. FWHMMap exposes its median that
+    way); a generic callable without ``__float__`` is evaluated at the image
+    centre instead. Returns ``None`` when no usable summary can be produced.
+    """
+    s = _fwhm_scalar(fwhm)
+    if s is not None:
+        return s
+    if _is_callable_fwhm(fwhm) and image_shape is not None:
+        H, W = image_shape[:2]
+        s = float(np.median(np.atleast_1d(fwhm(0.5 * W, 0.5 * H))))
+        if np.isfinite(s) and s > 0:
+            return s
+    return None
 
 
 def _extract_valid_positions(obj):
@@ -916,7 +927,7 @@ def measure_objects(
     else:
         log('Using user-provided noise map: median %.1f rms %.2f' % (np.median(err), np.std(err)))
 
-    fwhm_s = _fwhm_scalar(fwhm)
+    fwhm_s = _fwhm_median(fwhm, image.shape)
     fwhm_is_callable = _is_callable_fwhm(fwhm)
 
     if fwhm_s is not None:
@@ -1235,10 +1246,18 @@ def measure_objects(
 
         else:
             # Standard single-source optimal extraction
+            if fwhm_is_callable and psf is None:
+                x_vals, y_vals, _ = _extract_valid_positions(obj)
+                fwhm_per_source = np.asarray(fwhm(x_vals, y_vals), dtype=float)
+                if fwhm_per_source.ndim == 0:
+                    fwhm_per_source = np.full(len(obj), float(fwhm_per_source))
+            else:
+                fwhm_per_source = None
+
             for i, o in enumerate(obj):
                 if np.isfinite(o['x']) and np.isfinite(o['y']):
-                    if fwhm_is_callable and psf is None:
-                        psf_here = float(fwhm(o['x'], o['y']))
+                    if fwhm_per_source is not None:
+                        psf_here = float(fwhm_per_source[i])
                     else:
                         psf_here = psf_for_extraction
                     res = _optimal_extraction(
@@ -1542,7 +1561,7 @@ def measure_objects_sep(
     # Ensure error map is C-contiguous
     err = np.ascontiguousarray(err)
 
-    fwhm_s = _fwhm_scalar(fwhm)
+    fwhm_s = _fwhm_median(fwhm, image.shape)
     fwhm_is_callable = _is_callable_fwhm(fwhm)
 
     if fwhm_s is not None:
@@ -1643,6 +1662,8 @@ def measure_objects_sep(
         fwhm_at_pos = None
         if fwhm_is_callable:
             fwhm_at_pos = np.asarray(fwhm(x_vals[valid_pos], y_vals[valid_pos]), dtype=float)
+            if fwhm_at_pos.ndim == 0:
+                fwhm_at_pos = np.full(int(np.sum(valid_pos)), float(fwhm_at_pos))
 
         # Prepare per-source aperture radius.
         if fwhm_at_pos is not None:

@@ -211,6 +211,197 @@ class TestEstimateFwhmFromObjects:
         assert np.isnan(result)
 
 
+class TestSpatialFWHM:
+    """Test position-dependent FWHM estimation (spatial_order >= 1 / FWHMMap)."""
+
+    SIZE = 2048
+
+    @staticmethod
+    def _true_fwhm(x, y, size=SIZE):
+        """Linear FWHM ramp from 3.0 to 4.5 pixels across the field."""
+        return 3.0 + 1.0 * (np.asarray(x, dtype=float) / size) + 0.5 * (
+            np.asarray(y, dtype=float) / size
+        )
+
+    def _make_star_table(self, rng, n=500):
+        x = rng.uniform(0, self.SIZE, n)
+        y = rng.uniform(0, self.SIZE, n)
+        true = self._true_fwhm(x, y)
+        return Table(
+            {
+                'x': x,
+                'y': y,
+                'flux_radius': true / 2 + rng.normal(0, 0.05, n),
+                'a': true / 2.355 * 1.2,
+                'b': true / 2.355 * 1.1,
+                'flags': np.zeros(n, dtype=int),
+            }
+        )
+
+    def _max_probe_error(self, fmap):
+        s = self.SIZE
+        pts = [(100, 100), (s - 100, 100), (100, s - 100), (s - 100, s - 100), (s // 2, s // 2)]
+        return max(abs(float(fmap(px, py)) - self._true_fwhm(px, py)) for px, py in pts)
+
+    @pytest.mark.unit
+    def test_linear_recovery(self):
+        """Order-1 fit recovers a linear FWHM ramp."""
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng)
+        fmap = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=1, image_shape=(self.SIZE, self.SIZE)
+        )
+        assert isinstance(fmap, photometry.FWHMMap)
+        assert self._max_probe_error(fmap) < 0.1
+
+    @pytest.mark.unit
+    def test_quadratic_recovery(self):
+        """Order-2 fit recovers a quadratic FWHM surface."""
+        rng = np.random.default_rng(42)
+        n = 800
+        x = rng.uniform(0, self.SIZE, n)
+        y = rng.uniform(0, self.SIZE, n)
+        true = 3.0 + 1.5 * ((x - self.SIZE / 2) / self.SIZE) ** 2 + 0.5 * (y / self.SIZE)
+        obj = Table(
+            {
+                'x': x,
+                'y': y,
+                'flux_radius': true / 2 + rng.normal(0, 0.05, n),
+                'a': true / 2.355 * 1.2,
+                'b': true / 2.355 * 1.1,
+                'flags': np.zeros(n, dtype=int),
+            }
+        )
+        fmap = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=2, image_shape=(self.SIZE, self.SIZE)
+        )
+        assert isinstance(fmap, photometry.FWHMMap)
+        for px, py in [(100, 100), (self.SIZE // 2, self.SIZE // 2), (self.SIZE - 100, self.SIZE - 100)]:
+            tv = 3.0 + 1.5 * ((px - self.SIZE / 2) / self.SIZE) ** 2 + 0.5 * (py / self.SIZE)
+            assert abs(float(fmap(px, py)) - tv) < 0.1
+
+    @pytest.mark.unit
+    def test_float_conversion_and_call_shapes(self):
+        """float() gives the median; calls broadcast and clip to fwhm_range."""
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng)
+        fmap = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=1, image_shape=(self.SIZE, self.SIZE)
+        )
+        # Scalar summary is a plausible median of the 3.0-4.5 ramp
+        assert 3.0 < float(fmap) < 4.5
+        # Array call broadcasts
+        vals = fmap(np.array([0.0, 1024.0, 2048.0]), np.array([0.0, 1024.0, 2048.0]))
+        assert vals.shape == (3,)
+        # Extreme extrapolation stays within fwhm_range
+        assert fmap(1e6, 1e6) <= fmap.fwhm_range[1]
+        assert fmap(-1e6, -1e6) >= fmap.fwhm_range[0]
+
+    @pytest.mark.unit
+    def test_scalar_fallback_low_counts(self):
+        """Too few candidates for the requested order falls back to scalar."""
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng, n=10)
+        result = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=2, image_shape=(self.SIZE, self.SIZE)
+        )
+        assert not isinstance(result, photometry.FWHMMap)
+        assert np.isfinite(result)
+
+    @pytest.mark.unit
+    def test_scalar_fallback_missing_xy(self):
+        """Missing coordinate columns falls back to scalar."""
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng)
+        obj.remove_columns(['x', 'y'])
+        result = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=1, image_shape=(self.SIZE, self.SIZE)
+        )
+        assert not isinstance(result, photometry.FWHMMap)
+        assert np.isfinite(result)
+
+    @pytest.mark.unit
+    def test_flat_field_consistent_with_scalar(self):
+        """On a flat FWHM field the spatial fit agrees with the scalar estimate."""
+        rng = np.random.default_rng(42)
+        n = 500
+        obj = Table(
+            {
+                'x': rng.uniform(0, self.SIZE, n),
+                'y': rng.uniform(0, self.SIZE, n),
+                'flux_radius': 1.75 + rng.normal(0, 0.05, n),  # FWHM = 3.5
+                'a': np.full(n, 1.7),
+                'b': np.full(n, 1.6),
+                'flags': np.zeros(n, dtype=int),
+            }
+        )
+        scalar = photometry.estimate_fwhm_from_objects(obj, snr_min=None)
+        fmap = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, spatial_order=1, image_shape=(self.SIZE, self.SIZE)
+        )
+        assert isinstance(fmap, photometry.FWHMMap)
+        assert abs(float(fmap) - scalar) < 0.2
+        assert abs(float(fmap(100, 100)) - scalar) < 0.2
+
+    @pytest.mark.unit
+    def test_galaxy_contamination(self):
+        """Extended sources (large FWHM, large a*b) do not pull the surface.
+
+        This is the regime where unconditional a*b weighting would fail:
+        50 galaxies at FWHM~9 px holding ~45% of the total a*b weight.
+        """
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng)
+        ng = 50
+        gal = Table(
+            {
+                'x': rng.uniform(0, self.SIZE, ng),
+                'y': rng.uniform(0, self.SIZE, ng),
+                'flux_radius': rng.normal(4.5, 0.3, ng),  # FWHM ~ 9 px
+                'a': np.full(ng, 4.8),
+                'b': np.full(ng, 4.4),
+                'flags': np.zeros(ng, dtype=int),
+            }
+        )
+        from astropy.table import vstack
+
+        fmap = photometry.estimate_fwhm_from_objects(
+            vstack([obj, gal]), snr_min=None, spatial_order=1,
+            image_shape=(self.SIZE, self.SIZE),
+        )
+        assert isinstance(fmap, photometry.FWHMMap)
+        assert self._max_probe_error(fmap) < 0.15
+
+    @pytest.mark.unit
+    def test_substellar_contamination(self):
+        """Dominant sub-stellar spikes (cosmic rays) do not corrupt the surface.
+
+        The mode is biased low by the spikes; the ab-weighted-median guard
+        recovers the stellar reference and the window rejects the spikes.
+        """
+        rng = np.random.default_rng(42)
+        obj = self._make_star_table(rng, n=200)
+        ns = 400
+        spikes = Table(
+            {
+                'x': rng.uniform(0, self.SIZE, ns),
+                'y': rng.uniform(0, self.SIZE, ns),
+                'flux_radius': rng.normal(0.6, 0.05, ns),  # FWHM ~ 1.2 px
+                'a': np.full(ns, 0.7),
+                'b': np.full(ns, 0.65),
+                'flags': np.zeros(ns, dtype=int),
+            }
+        )
+        from astropy.table import vstack
+
+        fmap = photometry.estimate_fwhm_from_objects(
+            vstack([obj, spikes]), snr_min=None, spatial_order=1,
+            image_shape=(self.SIZE, self.SIZE),
+        )
+        assert isinstance(fmap, photometry.FWHMMap)
+        assert self._max_probe_error(fmap) < 0.15
+
+
 class TestSEPPhotometry:
     """Test SEP-based object detection and photometry."""
 
@@ -419,6 +610,103 @@ class TestSEPPhotometry:
         assert seen["grouped"] is True
         assert seen["group_radius_factor"] == pytest.approx(0.9)
         assert seen["group_halo_factor"] == pytest.approx(1.4)
+
+
+class TestSEPSpatialFWHM:
+    """Test spatial / callable FWHM integration in get_objects_sep."""
+
+    @staticmethod
+    def _make_varying_fwhm_image(size=256, n_grid=8, seed=42):
+        """Grid of bright Gaussians with FWHM ramping 2.5->4.0 px left to right."""
+        rng = np.random.RandomState(seed)
+        image = rng.normal(100, 2, (size, size))
+        yy, xx = np.mgrid[:size, :size]
+        margin = size // (2 * n_grid)
+        step = size // n_grid
+        for iy in range(n_grid):
+            for ix in range(n_grid):
+                sx = margin + ix * step + rng.uniform(-3, 3)
+                sy = margin + iy * step + rng.uniform(-3, 3)
+                sigma = (2.5 + 1.5 * sx / size) / 2.355
+                image += 2000.0 * np.exp(
+                    -((xx - sx) ** 2 + (yy - sy) ** 2) / (2 * sigma**2)
+                )
+        return image.astype(np.float64)
+
+    @staticmethod
+    def _constant_map(value=3.0, size=256):
+        return photometry.FWHMMap(
+            coeffs=[value, 0.0, 0.0],
+            order=1,
+            x0=size / 2,
+            y0=size / 2,
+            sx=size / 2,
+            sy=size / 2,
+            median=value,
+            n_used=100,
+            fwhm_range=(1.0, 20.0),
+        )
+
+    @pytest.mark.unit
+    def test_spatial_meta_and_serialization(self, tmp_path):
+        """Spatial auto-FWHM stores only a scalar summary in meta, and the
+        resulting table survives FITS and parquet round-trips."""
+        image = self._make_varying_fwhm_image()
+        obj = photometry.get_objects_sep(
+            image, fwhm=True, fwhm_spatial_order=1, verbose=False
+        )
+
+        assert len(obj) > 10
+        assert 'fwhm_phot' in obj.meta
+        assert isinstance(obj.meta['fwhm_phot'], float)
+        assert 2.0 < obj.meta['fwhm_phot'] < 5.0
+        # The live model object must not be stored — it breaks serialization
+        assert 'fwhm_phot_model' not in obj.meta
+
+        obj.write(tmp_path / 'obj.fits', overwrite=True)
+        pytest.importorskip('pyarrow')
+        obj.write(tmp_path / 'obj.parquet', overwrite=True)
+
+    @pytest.mark.unit
+    def test_fwhmmap_input_matches_scalar(self):
+        """A constant FWHMMap passed as fwhm gives the same photometry as the
+        equivalent scalar fwhm."""
+        image = self._make_varying_fwhm_image()
+
+        obj_scalar = photometry.get_objects_sep(image, fwhm=3.0, verbose=False)
+        obj_map = photometry.get_objects_sep(
+            image, fwhm=self._constant_map(3.0), verbose=False
+        )
+
+        assert len(obj_map) == len(obj_scalar)
+        assert np.allclose(obj_map['flux'], obj_scalar['flux'])
+        assert obj_map.meta['fwhm_phot'] == pytest.approx(3.0)
+        assert obj_map.meta['aper'] == pytest.approx(obj_scalar.meta['aper'])
+
+    @pytest.mark.unit
+    def test_generic_callable_fwhm(self):
+        """A generic callable (no __float__) is accepted, not silently ignored."""
+        image = self._make_varying_fwhm_image()
+
+        obj_scalar = photometry.get_objects_sep(image, fwhm=3.0, verbose=False)
+        obj_call = photometry.get_objects_sep(
+            image, fwhm=lambda x, y: np.full(np.shape(x), 3.0), verbose=False
+        )
+
+        assert len(obj_call) == len(obj_scalar)
+        assert np.allclose(obj_call['flux'], obj_scalar['flux'])
+        assert obj_call.meta['fwhm_phot'] == pytest.approx(3.0)
+
+    @pytest.mark.unit
+    def test_scalar_returning_callable(self):
+        """A callable returning a bare scalar is broadcast per source."""
+        image = self._make_varying_fwhm_image()
+
+        obj_scalar = photometry.get_objects_sep(image, fwhm=3.0, verbose=False)
+        obj_call = photometry.get_objects_sep(image, fwhm=lambda x, y: 3.0, verbose=False)
+
+        assert len(obj_call) == len(obj_scalar)
+        assert np.allclose(obj_call['flux'], obj_scalar['flux'])
 
 
 class TestSExtractorIntegration:

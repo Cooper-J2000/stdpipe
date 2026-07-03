@@ -1428,5 +1428,70 @@ class TestEPSFWithPSFModule:
         assert epsf['type'] == 'epsf'
 
 
+class TestCallableFWHM:
+    """Test callable (position-dependent) fwhm handling in measure_objects_psf."""
+
+    @staticmethod
+    def _constant_map(value=3.0, size=64):
+        from stdpipe.photometry import FWHMMap
+
+        return FWHMMap(
+            coeffs=[value, 0.0, 0.0],
+            order=1,
+            x0=size / 2,
+            y0=size / 2,
+            sx=size / 2,
+            sy=size / 2,
+            median=value,
+            n_used=100,
+            fwhm_range=(1.0, 20.0),
+        )
+
+    def _make_field(self):
+        rng = np.random.RandomState(42)
+        image = rng.normal(0, 1, (64, 64))
+        image += _make_gaussian_image(64, 32, 32, 3.0, 100.0)
+        obj = Table(
+            {
+                'x': [32.0],
+                'y': [32.0],
+                'flux': [500.0],
+                'fluxerr': [10.0],
+                'mag': [10.0],
+                'magerr': [0.02],
+            }
+        )
+        return image, obj
+
+    @pytest.mark.unit
+    def test_fwhmmap_no_psf(self):
+        """A FWHMMap with no explicit PSF builds the Gaussian model from its
+        median instead of crashing, and matches the scalar run."""
+        image, obj = self._make_field()
+
+        res_scalar = photometry_psf.measure_objects_psf(
+            obj.copy(), image, fwhm=3.0, verbose=False
+        )
+        res_map = photometry_psf.measure_objects_psf(
+            obj.copy(), image, fwhm=self._constant_map(3.0), verbose=False
+        )
+
+        assert np.all(np.isfinite(res_map['flux']))
+        np.testing.assert_allclose(res_map['flux'], res_scalar['flux'], rtol=1e-6)
+
+    @pytest.mark.unit
+    def test_generic_callable_no_psf(self):
+        """A generic callable without __float__ is summarized at the image centre."""
+        image, obj = self._make_field()
+
+        res = photometry_psf.measure_objects_psf(
+            obj.copy(),
+            image,
+            fwhm=lambda x, y: np.full(np.shape(x), 3.0),
+            verbose=False,
+        )
+        assert np.all(np.isfinite(res['flux']))
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

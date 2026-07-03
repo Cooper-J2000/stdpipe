@@ -2704,5 +2704,148 @@ class TestMeasureApertureDeblended:
         np.testing.assert_allclose(res_a['flux'], res_b['flux'])
 
 
+class TestCallableFWHM:
+    """Test position-dependent (callable) fwhm in the measurement routines.
+
+    A constant-valued callable must reproduce the equivalent scalar run.
+    """
+
+    @staticmethod
+    def _constant_map(value=3.0, size=256):
+        from stdpipe.photometry import FWHMMap
+
+        return FWHMMap(
+            coeffs=[value, 0.0, 0.0],
+            order=1,
+            x0=size / 2,
+            y0=size / 2,
+            sx=size / 2,
+            sy=size / 2,
+            median=value,
+            n_used=100,
+            fwhm_range=(1.0, 20.0),
+        )
+
+    @pytest.mark.unit
+    def test_aperture_callable_matches_scalar(self, image_with_sources, detected_objects):
+        """Aperture photometry with a constant FWHMMap matches the scalar run."""
+        res_scalar = photometry_measure.measure_objects(
+            detected_objects.copy(), image_with_sources, aper=2.0, fwhm=3.0, verbose=False
+        )
+        res_map = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=2.0,
+            fwhm=self._constant_map(3.0),
+            verbose=False,
+        )
+        np.testing.assert_allclose(res_map['flux'], res_scalar['flux'])
+
+    @pytest.mark.unit
+    def test_optimal_ungrouped_callable_matches_scalar(self, image_with_sources, detected_objects):
+        """Ungrouped optimal extraction uses the per-source callable width."""
+        res_scalar = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=5.0,
+            fwhm=3.0,
+            optimal=True,
+            group_sources=False,
+            verbose=False,
+        )
+        res_map = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=5.0,
+            fwhm=self._constant_map(3.0),
+            optimal=True,
+            group_sources=False,
+            verbose=False,
+        )
+        np.testing.assert_allclose(res_map['flux'], res_scalar['flux'])
+
+    @pytest.mark.unit
+    def test_optimal_grouped_callable_matches_scalar(self, image_with_sources, detected_objects):
+        """Grouped optimal extraction evaluates the callable at the group median."""
+        res_scalar = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=5.0,
+            fwhm=3.0,
+            optimal=True,
+            group_sources=True,
+            verbose=False,
+        )
+        res_map = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=5.0,
+            fwhm=self._constant_map(3.0),
+            optimal=True,
+            group_sources=True,
+            verbose=False,
+        )
+        np.testing.assert_allclose(res_map['flux'], res_scalar['flux'])
+
+    @pytest.mark.unit
+    def test_scalar_returning_lambda(self, image_with_sources, detected_objects):
+        """A callable returning a bare scalar works in the ungrouped path."""
+        res = photometry_measure.measure_objects(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=5.0,
+            fwhm=lambda x, y: 3.0,
+            optimal=True,
+            group_sources=False,
+            verbose=False,
+        )
+        assert np.all(np.isfinite(res['flux']))
+        assert np.all(res['flux'] > 0)
+
+    @pytest.mark.unit
+    @pytest.mark.skipif(
+        not photometry_measure._HAS_SEP_OPTIMAL, reason="Requires SEP 1.4+"
+    )
+    def test_measure_objects_sep_callable_matches_scalar(
+        self, image_with_sources, detected_objects
+    ):
+        """SEP backend broadcasts per-source callable values for aperture and optimal."""
+        for kwargs in [dict(), dict(optimal=True)]:
+            res_scalar = photometry_measure.measure_objects_sep(
+                detected_objects.copy(),
+                image_with_sources,
+                aper=2.0,
+                fwhm=3.0,
+                verbose=False,
+                **kwargs,
+            )
+            res_map = photometry_measure.measure_objects_sep(
+                detected_objects.copy(),
+                image_with_sources,
+                aper=2.0,
+                fwhm=self._constant_map(3.0),
+                verbose=False,
+                **kwargs,
+            )
+            np.testing.assert_allclose(res_map['flux'], res_scalar['flux'])
+
+    @pytest.mark.unit
+    @pytest.mark.skipif(
+        not photometry_measure._HAS_SEP_OPTIMAL, reason="Requires SEP 1.4+"
+    )
+    def test_measure_objects_sep_scalar_returning_lambda(
+        self, image_with_sources, detected_objects
+    ):
+        """A callable returning a bare scalar is broadcast in the SEP backend."""
+        res = photometry_measure.measure_objects_sep(
+            detected_objects.copy(),
+            image_with_sources,
+            aper=2.0,
+            fwhm=lambda x, y: 3.0,
+            verbose=False,
+        )
+        assert np.all(np.isfinite(res['flux']))
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -18,6 +18,7 @@ from photutils.utils import calc_total_error
 
 from . import photometry as phot
 from . import psf as psf_module
+from .photometry_measure import _is_callable_fwhm, _fwhm_median
 
 # Re-export for backward compatibility
 from .psf import create_psf_model
@@ -394,10 +395,12 @@ def measure_objects_psf(
     psf_size : int or None, optional
         Size of the PSF model in pixels. If None, will be estimated from PSF or
         set to 5*fwhm.
-    fwhm : float or None, optional
+    fwhm : float, callable or None, optional
         Full width at half maximum in pixels. Used if PSF model is not provided,
         or to estimate psf_size. If None, will be estimated from obj['fwhm'] if
-        available.
+        available. A position-dependent callable (e.g.
+        :class:`stdpipe.photometry.FWHMMap`) is accepted: its scalar summary
+        (median) is used for PSF model construction and sizing.
     mask : `~numpy.ndarray` or None, optional
         Image mask as a boolean array (True values will be masked).
     bg : `~numpy.ndarray` or None, optional
@@ -538,19 +541,30 @@ def measure_objects_psf(
             fwhm = 3.0
             log('FWHM not provided and not in object table, using default: %.2f pixels' % fwhm)
 
+    # Scalar summary of the FWHM for PSF model construction and stamp
+    # sizing; a position-dependent callable (e.g. FWHMMap) stays in ``fwhm``
+    # for the per-source quality metrics.
+    if _is_callable_fwhm(fwhm):
+        fwhm_scalar = _fwhm_median(fwhm, image.shape)
+    else:
+        fwhm_scalar = fwhm
+
     # Create or process PSF model
     psf_is_position_dependent = False  # Track if PSF varies with position
 
     if psf is None:
         # Create a simple Gaussian PSF
-        sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to sigma
-        log('Creating Gaussian PSF model with sigma=%.2f pixels (FWHM=%.2f)' % (sigma, fwhm))
+        sigma = fwhm_scalar / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to sigma
+        log(
+            'Creating Gaussian PSF model with sigma=%.2f pixels (FWHM=%.2f)'
+            % (sigma, fwhm_scalar)
+        )
 
         # Use CircularGaussianSigmaPRF (replaces deprecated IntegratedGaussianPRF)
         psf_model = photutils.psf.CircularGaussianSigmaPRF(sigma=sigma)
 
         if psf_size is None:
-            psf_size = _odd_int(5 * fwhm)
+            psf_size = _odd_int(5 * fwhm_scalar)
 
     elif isinstance(psf, dict) and 'data' in psf and 'sampling' in psf:
         # PSFEx-like dict structure (from run_psfex, load_psf, or create_psf_model)
@@ -601,7 +615,7 @@ def measure_objects_psf(
         log('Using provided PSF model')
         psf_model = psf
         if psf_size is None:
-            psf_size = _odd_int(5 * fwhm)
+            psf_size = _odd_int(5 * fwhm_scalar)
 
     log('Using PSF size: %d pixels' % psf_size)
 

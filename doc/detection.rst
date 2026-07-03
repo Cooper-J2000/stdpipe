@@ -145,7 +145,7 @@ Both use a sliding-window mode estimator that is resistant to outliers from gala
 Position-dependent FWHM
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-Wide-field images often show FWHM variation across the field from focus gradients, optical aberrations, or tracking. Passing ``spatial_order >= 1`` fits a 2-D polynomial ``FWHM(x, y)`` to the per-object values (with ``a*b`` weights and sigma-clipping) and returns a :class:`~stdpipe.photometry.FWHMMap` callable instead of a scalar. The callable evaluates the model at any position, and ``float(fwhm_map)`` gives a scalar median summary for APIs that require one.
+Wide-field images often show FWHM variation across the field from focus gradients, optical aberrations, or tracking. Passing ``spatial_order >= 1`` fits a 2-D polynomial ``FWHM(x, y)`` to the per-object values and returns a :class:`~stdpipe.photometry.FWHMMap` callable instead of a scalar. The fit uses the same anti-contamination guard as the scalar estimator: candidates are windowed to 0.5--2 times the guarded scalar estimate before the sigma-clipped fit, so sub-stellar spikes and extended sources cannot pull the surface. The callable evaluates the model at any position, and ``float(fwhm_map)`` gives a scalar median summary for APIs that require one.
 
 .. code-block:: python
 
@@ -158,13 +158,13 @@ Wide-field images often show FWHM variation across the field from focus gradient
 
 If too few high-quality candidates survive for the requested order, the function transparently falls back to the scalar path.
 
-:func:`~stdpipe.photometry.get_objects_sep` exposes the same feature via the ``fwhm_spatial_order`` parameter. When set, aperture and background-annulus radii are scaled per source and the per-source width is passed to ``sep.sum_circle_optimal`` (the windowed centroider still uses the scalar summary). The fitted model is stored in ``obj.meta['fwhm_phot_model']``:
+:func:`~stdpipe.photometry.get_objects_sep` exposes the same feature via the ``fwhm_spatial_order`` parameter. When set, aperture and background-annulus radii are scaled per source and the per-source width is passed to ``sep.sum_circle_optimal`` (the windowed centroider still uses the scalar summary). Only the scalar median summary is recorded in ``obj.meta['fwhm_phot']``, so the table stays serializable; keep the :class:`~stdpipe.photometry.FWHMMap` returned by :func:`~stdpipe.photometry.estimate_fwhm_from_objects` if the model itself is needed downstream:
 
 .. code-block:: python
 
    obj = photometry.get_objects_sep(image, fwhm=True, fwhm_spatial_order=2,
                                     optimal=True, aper=1.5, bkgann=(3, 5))
-   fmap = obj.meta['fwhm_phot_model']  # FWHMMap, or absent for scalar order=0
+   print(obj.meta['fwhm_phot'])  # scalar median of the fitted FWHM surface
 
 The downstream measurement routines :func:`~stdpipe.photometry.measure_objects` and :func:`~stdpipe.photometry_measure.measure_objects_sep` also accept a callable ``fwhm``. The SEP backend broadcasts a per-source width and per-source aperture/bkgann arrays directly to SEP; the pure-Python backend uses the per-source width in ungrouped optimal extraction and falls back to the scalar median where the underlying photutils APIs require a single radius.
 
