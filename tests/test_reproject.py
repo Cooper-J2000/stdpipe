@@ -107,16 +107,6 @@ class TestReprojectLanczos:
         hdr_out = hdr_in.copy()
         hdr_out['CD1_1'] = -cdelt * np.cos(angle)
         hdr_out['CD1_2'] = cdelt * np.sin(angle)
-        hdr_out['CD2_1'] = -cdelt * np.sin(angle)  # note sign
-        hdr_out['CD2_2'] = -cdelt * np.cos(angle)  # note sign - keep parity
-        # Fix: proper rotation matrix with correct parity
-        hdr_out['CD1_1'] = -cdelt * np.cos(angle)
-        hdr_out['CD1_2'] = -cdelt * np.sin(angle)
-        hdr_out['CD2_1'] = cdelt * np.sin(angle)
-        hdr_out['CD2_2'] = -cdelt * np.cos(angle)
-        # Actually let's just do it cleanly
-        hdr_out['CD1_1'] = -cdelt * np.cos(angle)
-        hdr_out['CD1_2'] = cdelt * np.sin(angle)
         hdr_out['CD2_1'] = cdelt * np.sin(angle)
         hdr_out['CD2_2'] = cdelt * np.cos(angle)
         wcs_out = WCS(hdr_out)
@@ -399,6 +389,30 @@ class TestReprojectLanczos:
         # Center should still be flagged
         assert result[64, 64] == 0x0004
 
+    def test_is_flags_downscale_or(self):
+        """Isolated flagged pixels survive downscaling via bitwise OR."""
+        wcs_in, hdr_in = _make_wcs()
+        ny, nx = hdr_in['NAXIS2'], hdr_in['NAXIS1']
+        flags = np.zeros((ny, nx), dtype=np.uint16)
+        # Isolated single-pixel flags: nearest-neighbour at 2x downscale
+        # would drop ~3/4 of them
+        positions = [(60, 61), (100, 100), (150, 151), (201, 200)]
+        for (y, x) in positions:
+            flags[y, x] = 0x0008
+
+        wcs_out, hdr_out = _make_wcs(
+            cdelt=(-2.0 / 3600, 2.0 / 3600),
+            crpix=(64.25, 64.25),
+            naxis=(128, 128),
+        )
+        result = reproject_lanczos(
+            [(flags, wcs_in)], wcs=wcs_out, header=hdr_out, is_flags=True,
+        )
+        # Every isolated input flag must appear in the output
+        assert np.sum(result == 0x0008) == len(positions)
+        # And no other flag values are invented
+        assert set(np.unique(result)).issubset({0, 0x0008})
+
     def test_is_flags_dtype_preserved(self):
         """Integer dtype is preserved for flag images."""
         wcs_in, hdr_in = _make_wcs()
@@ -410,6 +424,175 @@ class TestReprojectLanczos:
                 [(flags, wcs_in)], wcs=wcs_in, header=hdr_in, is_flags=True,
             )
             assert result.dtype == dtype
+
+    def test_is_flags_uncovered_sentinel(self):
+        """Uncovered regions in flag images get all-bits-set sentinel."""
+        wcs_in, hdr_in = _make_wcs(naxis=(64, 64), crpix=(32.5, 32.5))
+        wcs_out, hdr_out = _make_wcs(naxis=(128, 128), crpix=(64.5, 64.5))
+        flags = np.full((64, 64), 0x0002, dtype=np.uint16)
+
+        result = reproject_lanczos(
+            [(flags, wcs_in)], wcs=wcs_out, header=hdr_out, is_flags=True,
+        )
+        assert result[0, 0] == 0xFFFF  # uncovered corner: all masked
+        assert result[64, 64] == 0x0002  # covered centre: original flags
+
+        # use_nans=False: uncovered regions are zero instead
+        result0 = reproject_lanczos(
+            [(flags, wcs_in)], wcs=wcs_out, header=hdr_out,
+            is_flags=True, use_nans=False,
+        )
+        assert result0[0, 0] == 0
+        assert result0[64, 64] == 0x0002
+
+    def test_is_flags_partial_overlap_and(self):
+        """AND combine only involves frames actually covering a pixel."""
+        wcs1, _ = _make_wcs(naxis=(64, 64), crpix=(32.5, 32.5))
+        # Second frame shifted by 40 arcsec in RA (~28 px at dec=45)
+        wcs2, _ = _make_wcs(crval=(180.0 + 40.0 / 3600, 45.0),
+                            naxis=(64, 64), crpix=(32.5, 32.5))
+        wcs_out, hdr_out = _make_wcs(naxis=(128, 128), crpix=(64.5, 64.5))
+
+        m1 = np.full((64, 64), 0x0004, dtype=np.uint16)
+        m2 = np.full((64, 64), 0x0006, dtype=np.uint16)
+
+        result = reproject_lanczos(
+            [(m1, wcs1), (m2, wcs2)], wcs=wcs_out, header=hdr_out,
+            is_flags=True,
+        )
+        assert result[64, 50] == 0x0004  # both frames: 0x0004 & 0x0006
+        assert result[64, 80] == 0x0004  # frame 1 only: flags preserved
+        assert result[64, 20] == 0x0006  # frame 2 only: flags preserved
+        assert result[64, 110] == 0xFFFF  # no coverage: sentinel
+
+    def test_weight_nans_isolated_pixel(self):
+        """A single NaN pixel does not poison its kernel neighbourhood."""
+        wcs_in, hdr_in = _make_wcs()
+        image = np.ones((256, 256), dtype=np.float64)
+        image[100, 100] = np.nan
+
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in,
+        )
+        # Only the masked pixel itself stays NaN
+        assert np.sum(~np.isfinite(result)) == 1
+        assert np.isnan(result[100, 100])
+        # Neighbours are renormalized over valid pixels
+        assert abs(result[100, 101] - 1.0) < 1e-6
+        assert abs(result[99, 100] - 1.0) < 1e-6
+
+        # Legacy propagation mode: NaN spreads over the kernel support
+        result_prop = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in, weight_nans=False,
+        )
+        assert np.sum(~np.isfinite(result_prop)) > 30
+
+    def test_weight_nans_subpixel_shift(self):
+        """Weighted resampling keeps values accurate next to a masked pixel."""
+        wcs_in, hdr_in = _make_wcs()
+        image = np.ones((256, 256), dtype=np.float64)
+        image[100, 100] = np.nan
+
+        # Shift by 0.3 pixels
+        shift = 0.3 / 3600 / np.cos(np.radians(45.0))
+        wcs_out, hdr_out = _make_wcs(crval=(180.0 + shift, 45.0))
+
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_out, header=hdr_out,
+        )
+        # At most a couple of pixels dominated by the hole stay NaN
+        assert np.sum(~np.isfinite(result)) <= 4
+        # Renormalized values around the hole stay accurate
+        box = result[97:104, 97:104]
+        assert np.nanmax(np.abs(box - 1.0)) < 0.01
+
+    def test_weight_nans_masked_block(self):
+        """A fully masked region stays masked (not invented from edges)."""
+        wcs_in, hdr_in = _make_wcs()
+        image = np.ones((256, 256), dtype=np.float64)
+        image[100:120, 100:120] = np.nan
+
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in,
+        )
+        assert np.sum(~np.isfinite(result)) == 400
+        assert np.all(~np.isfinite(result[100:120, 100:120]))
+
+    def test_weight_nans_clean_image_identical(self):
+        """Weight machinery must not activate for images without NaNs."""
+        wcs_in, hdr_in = _make_wcs()
+        rng = np.random.default_rng(42)
+        image = rng.normal(100.0, 5.0, (256, 256))
+
+        a = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in, weight_nans=True,
+        )
+        b = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in, weight_nans=False,
+        )
+        np.testing.assert_array_equal(a, b)
+
+    def test_use_nans_false_float(self):
+        """use_nans=False fills uncovered float regions with zeros."""
+        wcs_in, hdr_in = _make_wcs(naxis=(64, 64), crpix=(32.5, 32.5))
+        wcs_out, hdr_out = _make_wcs(naxis=(128, 128), crpix=(64.5, 64.5))
+        image = np.ones((64, 64), dtype=np.float64)
+
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_out, header=hdr_out, use_nans=False,
+        )
+        assert np.all(np.isfinite(result))
+        assert result[0, 0] == 0.0
+        assert abs(result[64, 64] - 1.0) < 0.01
+
+    def test_flux_conservation_nonsquare_pixels(self):
+        """Per-pixel Jacobian handles non-square output pixels correctly."""
+        wcs_in, hdr_in = _make_wcs()
+        ny, nx = hdr_in['NAXIS2'], hdr_in['NAXIS1']
+        image = np.ones((ny, nx), dtype=np.float64)
+
+        # Output: 2x1 arcsec pixels — area ratio exactly 2.0
+        # (mean-scale-based scaling would give ((2+1)/2)^2 = 2.25)
+        wcs_out, hdr_out = _make_wcs(
+            cdelt=(-2.0 / 3600, 1.0 / 3600),
+            crpix=(64.25, 128.5),
+            naxis=(128, 256),
+        )
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_out, header=hdr_out,
+            conserve_flux=True, oversamp=1,
+        )
+        interior = result[10:-10, 10:-10]
+        good = np.isfinite(interior)
+        assert abs(np.mean(interior[good]) / 2.0 - 1.0) < 0.01
+
+    def test_parallel_matches_serial(self):
+        """parallel=2 must give the same results as the serial path."""
+        wcs_in, hdr_in = _make_wcs()
+        image = _make_star_image(wcs_in, hdr_in, flux=10000.0, fwhm=4.0)
+
+        serial = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in, parallel=False,
+        )
+        parallel = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, header=hdr_in, parallel=2,
+        )
+        # Chunk-seam rows use one-sided instead of central differences for
+        # the local Jacobian, giving ~1e-10 relative differences there
+        np.testing.assert_allclose(serial, parallel, rtol=1e-8)
+
+    def test_missing_dimensions(self):
+        """Missing output dimensions returns None instead of raising."""
+        wcs_in, hdr_in = _make_wcs()
+        image = np.ones((256, 256), dtype=np.float64)
+
+        result = reproject_lanczos([(image, wcs_in)], wcs=wcs_in)
+        assert result is None
+
+        result = reproject_lanczos(
+            [(image, wcs_in)], wcs=wcs_in, return_footprint=True,
+        )
+        assert result == (None, None)
 
     # -----------------------------------------------------------------------
     # Footprint tests
