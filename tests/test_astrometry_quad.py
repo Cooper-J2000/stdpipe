@@ -30,9 +30,8 @@ from stdpipe.astrometry_quad import (
     _mutual_nearest_neighbor,
     multiprobe_desc_keys,
     compute_bin_edges,
-    tan_project_deg,
     baseline_rank_bins,
-    mag_signature,
+    mag_orderings_consistent,
     _robust_sigma,
 )
 
@@ -179,22 +178,25 @@ class TestGeometricOperations:
         assert np.abs(sigma - 2.0) < 0.5
 
     @pytest.mark.unit
-    def test_mag_signature(self):
-        """Test magnitude signature (brightness ordering)."""
-        mags = np.array([15.0, 12.0, 18.0, 14.0])
+    def test_mag_orderings_consistent(self):
+        """Test tolerant pairwise brightness ordering check."""
+        a = np.array([15.0, 12.0, 18.0, 14.0])
 
-        sig = mag_signature(mags)
+        # Identical orderings (with a constant zero-point offset) agree
+        assert mag_orderings_consistent(a, a + 3.0, tol=0.5)
 
-        # Should be sorted indices: 1 (12.0), 3 (14.0), 0 (15.0), 2 (18.0)
-        assert sig == (1, 3, 0, 2)
+        # A strongly-separated pair swapped -> inconsistent
+        b = np.array([12.0, 15.0, 18.0, 14.0])
+        assert not mag_orderings_consistent(a, b, tol=0.5)
 
     @pytest.mark.unit
-    def test_mag_signature_validation(self):
-        """Test that mag_signature validates input length."""
-        mags = np.array([15.0, 12.0, 18.0])  # Only 3 elements
+    def test_mag_orderings_consistent_tolerance(self):
+        """Near-equal pairs may swap order without being rejected."""
+        a = np.array([15.0, 15.2, 18.0, 14.0])
+        b = np.array([15.2, 15.0, 18.0, 14.0])  # 0.2-mag pair flipped
 
-        with pytest.raises(ValueError, match="Expected 4 magnitudes"):
-            mag_signature(mags)
+        assert not mag_orderings_consistent(a, b, tol=0.1)
+        assert mag_orderings_consistent(a, b, tol=0.5)
 
     @pytest.mark.unit
     def test_baseline_rank_bins(self):
@@ -248,7 +250,7 @@ class TestGeometricOperations:
         """Precomputed quad descriptors should produce the same hash."""
         pts = simple_quad_points
         quad_array = np.array(make_local_quads(pts, k=3), dtype=np.int32)
-        descs, lens = quad_descriptor_batch(pts, quad_array)
+        descs, lens, order = quad_descriptor_batch(pts, quad_array)
 
         h_default = build_quad_hash_multiscale(
             pts, mags=None, k=3, eps=0.001, n_scale_bins=1, allow_reflection=True
@@ -263,6 +265,7 @@ class TestGeometricOperations:
             quad_array=quad_array,
             descs=descs,
             lens=lens,
+            order=order,
         )
 
         assert set(h_default.keys()) == set(h_precomputed.keys())
@@ -270,57 +273,6 @@ class TestGeometricOperations:
             idx_default = [entry.idxs for entry in h_default[key]]
             idx_precomputed = [entry.idxs for entry in h_precomputed[key]]
             assert idx_default == idx_precomputed
-
-
-class TestTANProjection:
-    """Test TAN projection operations."""
-
-    @pytest.mark.unit
-    def test_tan_project_zero_offset(self):
-        """Test TAN projection of reference point (should be zero)."""
-        ra0, dec0 = 180.0, 45.0
-
-        u, v = tan_project_deg(
-            np.array([ra0]), np.array([dec0]), ra0, dec0
-        )
-
-        # Projection of reference point should be (0, 0)
-        assert np.abs(u[0]) < 1e-10
-        assert np.abs(v[0]) < 1e-10
-
-    @pytest.mark.unit
-    def test_tan_project_small_offset(self):
-        """Test TAN projection for small offsets."""
-        ra0, dec0 = 180.0, 0.0
-
-        # 1 degree offset in RA at equator
-        ra = np.array([181.0])
-        dec = np.array([0.0])
-
-        u, v = tan_project_deg(ra, dec, ra0, dec0)
-
-        # At equator, 1 degree in RA should project to ~1 degree in tangent plane
-        # u should be positive (not negative) for RA increase
-        # In radians: 1 deg = 0.0174533 rad
-        assert np.abs(u[0] - np.deg2rad(1.0)) < 0.05  # Relaxed tolerance for TAN projection
-        assert np.abs(v[0]) < 0.01
-
-    @pytest.mark.unit
-    def test_tan_project_array(self):
-        """Test TAN projection with arrays."""
-        ra0, dec0 = 180.0, 0.0
-
-        ra = np.array([179.0, 180.0, 181.0])
-        dec = np.array([0.0, 0.0, 0.0])
-
-        u, v = tan_project_deg(ra, dec, ra0, dec0)
-
-        # Should return same-length arrays
-        assert len(u) == 3
-        assert len(v) == 3
-        # Middle point should be near zero
-        assert np.abs(u[1]) < 1e-10
-        assert np.abs(v[1]) < 1e-10
 
 
 class TestSimilarityTransform:
@@ -803,7 +755,7 @@ class TestWCSRefinementInterface:
         wcs_init.pixel_shape = (64, 64)
 
         def fake_pattern_match(
-            self, det_xy, det_mag, ref_uv, ref_mag, wcs_init, pixel_scale_arcsec, cfg=None
+            self, det_xy, det_mag, ref_uv, ref_mag, pixel_scale_arcsec, cfg=None
         ):
             pairs = [(i, i) for i in range(n)]
             top_hyp = [(1.0, np.eye(2), np.zeros(2), 1.0)]
@@ -1232,10 +1184,10 @@ class TestAstrometryConfig:
         """Test default configuration."""
         config = AstrometryConfig()
 
-        assert config.n_det == 180
-        assert config.n_ref == 380
+        assert config.n_det == 150
+        assert config.n_ref == 600
         assert config.sip_degree == 3
-        assert config.neighbor_k == 8
+        assert config.neighbor_k == 10
 
     @pytest.mark.unit
     def test_custom_config(self):

@@ -1,7 +1,9 @@
 """
 Quad-hash astrometry solver (Python-only) with practical upgrades:
 
-1) Multi-scale quad pools:
+1) Multi-scale quad pools with canonical descriptors:
+   - fully canonical quad descriptors (astrometry.net-style A/B convention),
+     so a hash hit directly provides the point correspondence for the fit
    - quads are partitioned into baseline-length *rank bins* (e.g. 6 bins)
    - consistent binning between detection and reference sets via shared edges
    - matching is done only within the same bin, reducing ambiguity
@@ -31,7 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -61,25 +63,6 @@ def _finite_mask(*cols) -> np.ndarray:
     return m
 
 
-def _pick_brightest_obj(obj: Table, n: int) -> np.ndarray:
-    if "flux" in obj.colnames:
-        v = _as_float_array(obj["flux"])
-        key = -v  # higher flux = brighter
-    elif "mag" in obj.colnames:
-        v = _as_float_array(obj["mag"])
-        key = v  # lower mag = brighter
-    else:
-        raise ValueError("obj must contain 'flux' or 'mag'")
-    idx = np.argsort(key)
-    return idx[: min(n, len(idx))]
-
-
-def _pick_brightest_cat(cat: Table, n: int) -> np.ndarray:
-    v = _as_float_array(cat["mag"])
-    idx = np.argsort(v)
-    return idx[: min(n, len(idx))]
-
-
 def _robust_sigma(x: np.ndarray) -> float:
     x = np.asarray(x, dtype=np.float64)
     med = np.nanmedian(x)
@@ -87,40 +70,21 @@ def _robust_sigma(x: np.ndarray) -> float:
     return 1.4826 * mad if mad > 0 else np.nanstd(x)
 
 
-def mag_signature(mags4: np.ndarray) -> Tuple[int, int, int, int]:
-    mags4 = np.asarray(mags4, dtype=np.float64)
-    if len(mags4) != 4:
-        raise ValueError(f"Expected 4 magnitudes, got {len(mags4)}")
-    return tuple(np.argsort(mags4).astype(int).tolist())
+def mag_orderings_consistent(mags_a, mags_b, tol: float = 0.5) -> bool:
+    """Check that pairwise brightness orderings of two corresponding point
+    sets agree within a tolerance.
 
-
-# -----------------------------
-# TAN projection
-# -----------------------------
-
-
-def tan_project_deg(
-    ra_deg: np.ndarray, dec_deg: np.ndarray, ra0_deg: float, dec0_deg: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    ra = np.deg2rad(_as_float_array(ra_deg))
-    dec = np.deg2rad(_as_float_array(dec_deg))
-    ra0 = np.deg2rad(float(ra0_deg))
-    dec0 = np.deg2rad(float(dec0_deg))
-
-    dra = (ra - ra0 + np.pi) % (2 * np.pi) - np.pi
-
-    sin_dec, cos_dec = np.sin(dec), np.cos(dec)
-    sin_dec0, cos_dec0 = np.sin(dec0), np.cos(dec0)
-    cos_dra = np.cos(dra)
-    sin_dra = np.sin(dra)
-
-    denom = sin_dec0 * sin_dec + cos_dec0 * cos_dec * cos_dra
-    eps = 1e-12
-    denom = np.where(np.abs(denom) < eps, np.sign(denom) * eps, denom)
-
-    u = (cos_dec * sin_dra) / denom
-    v = (cos_dec0 * sin_dec - sin_dec0 * cos_dec * cos_dra) / denom
-    return u, v
+    Only pairs whose magnitude difference exceeds ``tol`` in *both* sets are
+    required to agree in sign, so noise-flipped orderings of nearly
+    equal-brightness stars are not rejected.  Insensitive to a constant
+    magnitude offset (instrumental vs catalogue zero point).
+    """
+    a = np.asarray(mags_a, dtype=np.float64)
+    b = np.asarray(mags_b, dtype=np.float64)
+    da = a[:, None] - a[None, :]
+    db = b[:, None] - b[None, :]
+    bad = (np.abs(da) > tol) & (np.abs(db) > tol) & (da * db < 0)
+    return not bool(bad.any())
 
 
 # -----------------------------
@@ -290,42 +254,21 @@ def quad_descriptor(P: np.ndarray) -> Tuple[np.ndarray, float]:
     Returns (desc[4], baseline_len).
     """
     P = np.asarray(P, dtype=np.float64)
-    d2 = np.sum((P[None, :, :] - P[:, None, :]) ** 2, axis=2)
-    i, j = np.unravel_index(np.argmax(d2), d2.shape)
-    if i == j:
-        return np.full(4, np.nan), np.nan
-
-    A = P[i]
-    B = P[j]
-    base = B - A
-    L = float(np.hypot(base[0], base[1]))
-    if L <= 0:
-        return np.full(4, np.nan), np.nan
-
-    e1 = base / L
-    e2 = np.array([-e1[1], e1[0]], dtype=np.float64)
-
-    idx = [k for k in range(4) if k not in (i, j)]
-    C = P[idx[0]]
-    D = P[idx[1]]
-
-    c = np.array([np.dot(C - A, e1), np.dot(C - A, e2)], dtype=np.float64) / L
-    d = np.array([np.dot(D - A, e1), np.dot(D - A, e2)], dtype=np.float64) / L
-
-    pair = np.stack([c, d], axis=0)
-    order = np.lexsort((pair[:, 1], pair[:, 0]))
-    pair = pair[order]
-
-    desc = np.array([pair[0, 0], pair[0, 1], pair[1, 0], pair[1, 1]], dtype=np.float64)
-    return desc, L
+    descs, lens, _ = quad_descriptor_batch(P, np.arange(4, dtype=np.int32)[None, :])
+    return descs[0], float(lens[0])
 
 
-# Phase 2 Optimization: Vectorized quad descriptor calculation
 def quad_descriptor_batch(
     points: np.ndarray, quad_indices: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Vectorized quad descriptor calculation for multiple quads.
+    Vectorized canonical quad descriptor calculation for multiple quads.
+
+    The descriptor is a pure geometric invariant of the 4-point set: the
+    baseline endpoint A is chosen such that cx + dx <= 1 (astrometry.net
+    convention) and C, D are ordered lexicographically, so the same physical
+    quad yields the same descriptor and point order regardless of the order
+    in which the indices are listed.
 
     Args:
         points: (N, 2) array of point coordinates
@@ -334,13 +277,17 @@ def quad_descriptor_batch(
     Returns:
         descs: (M, 4) array of descriptors
         lens: (M,) array of baseline lengths
+        order: (M, 4) array of point indices in canonical (A, B, C, D)
+            order (-1 for degenerate quads)
     """
+    quad_indices = np.asarray(quad_indices)
     M = quad_indices.shape[0]
     descs = np.full((M, 4), np.nan, dtype=np.float64)
     lens = np.full(M, np.nan, dtype=np.float64)
+    order = np.full((M, 4), -1, dtype=np.int64)
 
     if M == 0:
-        return descs, lens
+        return descs, lens, order
 
     # Gather all quad points: (M, 4, 2)
     P = points[quad_indices]
@@ -359,7 +306,7 @@ def quad_descriptor_batch(
 
     # Process only valid quads
     if not np.any(valid):
-        return descs, lens
+        return descs, lens, order
 
     valid_mask = np.where(valid)[0]
     M_valid = len(valid_mask)
@@ -375,7 +322,7 @@ def quad_descriptor_batch(
     # Filter out zero-length baselines
     valid_L = L > 0
     if not np.any(valid_L):
-        return descs, lens
+        return descs, lens, order
 
     final_mask = valid_mask[valid_L]
     M_final = len(final_mask)
@@ -422,24 +369,33 @@ def quad_descriptor_batch(
         np.stack([np.sum(D_vec * e1, axis=1), np.sum(D_vec * e2, axis=1)], axis=1) / L[:, None]
     )  # (M_final, 2)
 
-    # Sort coordinates lexicographically for each quad (vectorized)
-    # Stack c and d coordinates: (M_final, 2, 2) - 2 points × 2 coords
-    pairs = np.stack([c_coords, d_coords], axis=1)  # (M_final, 2, 2)
-
-    # Determine which point should come first (lexicographic order)
-    # First compare x-coordinates ([:,0]), then y-coordinates ([:,1])
-    swap = (pairs[:, 0, 0] > pairs[:, 1, 0]) | (
-        (pairs[:, 0, 0] == pairs[:, 1, 0]) & (pairs[:, 0, 1] > pairs[:, 1, 1])
+    # Canonical A/B choice (astrometry.net convention): require cx + dx <= 1.
+    # Swapping A and B maps internal coordinates (x, y) -> (1 - x, -y).
+    swap_ab = (c_coords[:, 0] + d_coords[:, 0]) > 1.0
+    c_coords[swap_ab] = np.stack(
+        [1.0 - c_coords[swap_ab, 0], -c_coords[swap_ab, 1]], axis=1
     )
+    d_coords[swap_ab] = np.stack(
+        [1.0 - d_coords[swap_ab, 0], -d_coords[swap_ab, 1]], axis=1
+    )
+    A_pos = np.where(swap_ab, j_idx_final, i_idx_final)
+    B_pos = np.where(swap_ab, i_idx_final, j_idx_final)
 
-    # Swap where needed
-    pairs[swap] = pairs[swap, ::-1, :]
+    # Canonical C/D order: lexicographic by (x, y)
+    swap_cd = (c_coords[:, 0] > d_coords[:, 0]) | (
+        (c_coords[:, 0] == d_coords[:, 0]) & (c_coords[:, 1] > d_coords[:, 1])
+    )
+    c_fin = np.where(swap_cd[:, None], d_coords, c_coords)
+    d_fin = np.where(swap_cd[:, None], c_coords, d_coords)
+    C_pos = np.where(swap_cd, D_indices, C_indices)
+    D_pos = np.where(swap_cd, C_indices, D_indices)
 
-    # Flatten to descriptor format: [x1, y1, x2, y2]
-    descs[final_mask] = pairs.reshape(M_final, 4)
+    descs[final_mask] = np.concatenate([c_fin, d_fin], axis=1)
     lens[final_mask] = L
+    pos = np.stack([A_pos, B_pos, C_pos, D_pos], axis=1)
+    order[final_mask] = np.take_along_axis(quad_indices[final_mask], pos, axis=1)
 
-    return descs, lens
+    return descs, lens, order
 
 
 def quantize_desc(desc: np.ndarray, eps: float) -> Tuple[int, int, int, int]:
@@ -449,39 +405,33 @@ def quantize_desc(desc: np.ndarray, eps: float) -> Tuple[int, int, int, int]:
 
 def reflect_desc(desc: np.ndarray) -> np.ndarray:
     """Reflect quad descriptor across its baseline (flip y) with lexicographic re-ordering."""
-    x1, y1, x2, y2 = (float(desc[0]), float(desc[1]), float(desc[2]), float(desc[3]))
-    y1 = -y1
-    y2 = -y2
+    return _reflect_desc_order(desc)[0]
+
+
+def _reflect_desc_order(desc: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Reflect descriptor across baseline; also report whether C/D swapped."""
+    x1, y1, x2, y2 = (float(desc[0]), -float(desc[1]), float(desc[2]), -float(desc[3]))
     if (x1 > x2) or (x1 == x2 and y1 > y2):
-        x1, y1, x2, y2 = x2, y2, x1, y1
-    return np.array([x1, y1, x2, y2], dtype=np.float64)
+        return np.array([x2, y2, x1, y1], dtype=np.float64), True
+    return np.array([x1, y1, x2, y2], dtype=np.float64), False
 
 
-# Phase 1 Optimization: Pre-computed neighbor offsets cache
-_NEIGHBOR_OFFSETS_CACHE: Dict[int, np.ndarray] = {}
+def _ab_swap_desc_order(desc: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Descriptor after swapping baseline endpoints A/B, i.e. (x, y) -> (1-x, -y),
+    with lexicographic re-ordering; also report whether C/D swapped."""
+    x1, y1, x2, y2 = (
+        1.0 - float(desc[0]),
+        -float(desc[1]),
+        1.0 - float(desc[2]),
+        -float(desc[3]),
+    )
+    if (x1 > x2) or (x1 == x2 and y1 > y2):
+        return np.array([x2, y2, x1, y1], dtype=np.float64), True
+    return np.array([x1, y1, x2, y2], dtype=np.float64), False
 
 
-def _get_neighbor_offsets(r: int) -> np.ndarray:
-    """Get pre-computed neighbor offsets for given radius."""
-    if r not in _NEIGHBOR_OFFSETS_CACHE:
-        x = np.arange(-r, r + 1, dtype=np.int32)
-        # Create meshgrid and reshape to (n_neighbors, 4)
-        grid = np.meshgrid(x, x, x, x, indexing='ij')
-        offsets = np.stack([g.ravel() for g in grid], axis=1)
-        _NEIGHBOR_OFFSETS_CACHE[r] = offsets
-    return _NEIGHBOR_OFFSETS_CACHE[r]
-
-
-def neighbors_bins(
-    key: Tuple[int, int, int, int], r: int = 1
-) -> Iterable[Tuple[int, int, int, int]]:
-    """Generate neighbor bins using optimized pre-computed offsets."""
-    offsets = _get_neighbor_offsets(r)
-    key_arr = np.array(key, dtype=np.int32)
-    neighbors = key_arr + offsets
-    # Return as tuples of Python ints for compatibility (important for dict keys)
-    for neighbor in neighbors:
-        yield tuple(int(x) for x in neighbor)
+def _swap_cd(idxs: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    return (idxs[0], idxs[1], idxs[3], idxs[2])
 
 
 def multiprobe_desc_keys(
@@ -565,23 +515,17 @@ def baseline_rank_bins(
         return np.zeros(0, dtype=np.int16)
     if n_bins <= 1:
         return np.zeros(n, dtype=np.int16)
-    if edges is not None:
-        b = np.searchsorted(edges[1:-1], lengths, side="right")
-        return np.clip(b, 0, n_bins - 1).astype(np.int16)
-    qs = np.quantile(lengths, q=np.linspace(0, 1, n_bins + 1))
-    # make strictly increasing to avoid pathological equal-quantile edges
-    for i in range(1, len(qs)):
-        if qs[i] <= qs[i - 1]:
-            qs[i] = np.nextafter(qs[i - 1], np.inf)
-    b = np.searchsorted(qs[1:-1], lengths, side="right")
-    return b.astype(np.int16)
+    if edges is None:
+        edges = compute_bin_edges(lengths, n_bins)
+        if edges is None:
+            return np.zeros(n, dtype=np.int16)
+    b = np.searchsorted(edges[1:-1], lengths, side="right")
+    return np.clip(b, 0, n_bins - 1).astype(np.int16)
 
 
 @dataclass
 class QuadEntry:
     idxs: Tuple[int, int, int, int]
-    desc: np.ndarray
-    bin_id: int
     mags: Optional[Tuple[float, float, float, float]] = None
 
 
@@ -596,27 +540,31 @@ def build_quad_hash_multiscale(
     quad_array: Optional[np.ndarray] = None,
     descs: Optional[np.ndarray] = None,
     lens: Optional[np.ndarray] = None,
+    order: Optional[np.ndarray] = None,
 ) -> Dict[Tuple[int, Tuple[int, int, int, int]], List[QuadEntry]]:
     """
     Hash key: (scale_bin_id, quantized_descriptor)
 
+    Entries store point indices in the canonical (A, B, C, D) descriptor
+    order, so a hash hit directly provides the point correspondence for the
+    transform fit.
+
     If bin_edges is provided, use those for baseline binning instead of
     computing quantiles from the data. This enables consistent binning
     between detection and reference sets.
-
-    Phase 2 Optimization: Uses vectorized quad descriptor calculation.
     """
-    if quad_array is None or descs is None or lens is None:
+    if quad_array is None or descs is None or lens is None or order is None:
         quads = make_local_quads(points, k=k)
         if not quads:
             return {}
 
         quad_array = np.array(quads, dtype=np.int32)
-        descs, lens = quad_descriptor_batch(points, quad_array)
+        descs, lens, order = quad_descriptor_batch(points, quad_array)
     else:
         quad_array = np.asarray(quad_array, dtype=np.int32)
         descs = np.asarray(descs, dtype=np.float64)
         lens = np.asarray(lens, dtype=np.float64)
+        order = np.asarray(order, dtype=np.int64)
 
         if quad_array.ndim != 2 or quad_array.shape[1] != 4:
             raise ValueError("quad_array must be (N, 4)")
@@ -624,39 +572,56 @@ def build_quad_hash_multiscale(
             raise ValueError("descs must have shape (N, 4)")
         if lens.shape != (len(quad_array),):
             raise ValueError("lens must have shape (N,)")
+        if order.shape != (len(quad_array), 4):
+            raise ValueError("order must have shape (N, 4)")
 
-    # Phase 1: Use boolean indexing instead of list comprehension
-    ok = np.isfinite(descs).all(axis=1) & np.isfinite(lens) & (lens > 0)
-    quads_ok = quad_array[ok]  # Keep as numpy array
+    ok = (
+        np.isfinite(descs).all(axis=1)
+        & np.isfinite(lens)
+        & (lens > 0)
+        & np.all(order >= 0, axis=1)
+    )
+    order_ok = order[ok]
     descs_ok = descs[ok]
     lens_ok = lens[ok]
 
-    if len(quads_ok) == 0:
+    if len(order_ok) == 0:
         return {}
 
     bins = baseline_rank_bins(lens_ok, n_bins=n_scale_bins, edges=bin_edges)
 
-    # Phase 1: Pre-allocate and use numpy operations
+    # Near the A/B canonicalization boundary (cx + dx == 1) noise can flip
+    # the canonical endpoint choice between detection and reference sets, so
+    # quads close to it are also inserted with the endpoints swapped.
+    ab_boundary = 2.0 * eps
+
     H: Dict[Tuple[int, Tuple[int, int, int, int]], List[QuadEntry]] = {}
-    for i in range(len(quads_ok)):
-        q = tuple(quads_ok[i])  # Convert to tuple for QuadEntry
+    for i in range(len(order_ok)):
+        q = tuple(int(v) for v in order_ok[i])
         desc = descs_ok[i]
         b = int(bins[i])
 
-        me = None
-        if mags is not None:
-            me = tuple(float(mags[idx]) for idx in q)
-        entry = QuadEntry(idxs=q, desc=desc, bin_id=b, mags=me)
-
-        # Insert descriptor and its reflected counterpart to handle parity flips
-        key = (b, quantize_desc(desc, eps))
-        H.setdefault(key, []).append(entry)
-
+        variants = [(desc, q)]
+        if abs(desc[0] + desc[2] - 1.0) <= ab_boundary:
+            desc_ab, cd_swap = _ab_swap_desc_order(desc)
+            q_ab = (q[1], q[0], q[2], q[3])
+            variants.append((desc_ab, _swap_cd(q_ab) if cd_swap else q_ab))
         if allow_reflection:
-            desc_ref = reflect_desc(desc)
-            key_ref = (b, quantize_desc(desc_ref, eps))
-            if key_ref != key:
-                H.setdefault(key_ref, []).append(entry)
+            # Reflected counterparts of all variants to handle parity flips
+            for dv, qv in list(variants):
+                desc_ref, cd_swap = _reflect_desc_order(dv)
+                variants.append((desc_ref, _swap_cd(qv) if cd_swap else qv))
+
+        seen_keys = set()
+        for dv, qv in variants:
+            key = (b, quantize_desc(dv, eps))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            me = None
+            if mags is not None:
+                me = tuple(float(mags[idx]) for idx in qv)
+            H.setdefault(key, []).append(QuadEntry(idxs=qv, mags=me))
 
     return H
 
@@ -703,33 +668,32 @@ def _auto_match_resolution(det_xy: np.ndarray, ref_uv: np.ndarray) -> Optional[f
 @dataclass
 class AstrometryConfig:
     # Selection sizes
-    n_det: int = 180
-    n_ref: int = 380
+    n_det: int = 150
+    n_ref: int = 600
 
     # Quads
-    neighbor_k: int = 8
-    eps_desc: float = 0.015
-    bin_neighbor_radius: int = 1
+    neighbor_k: int = 10
+    eps_desc: float = 0.02
     n_scale_bins: int = 6
 
     allow_reflection: bool = True
     use_mag_signature: bool = True
+    mag_tolerance: float = 0.5  # ordering disagreements below this (mag) are ignored
 
-    # WCS prior constraints (use initial WCS to filter hypotheses)
+    # Hypothesis sanity checks: both point sets live in the same pixel space
+    # (catalogue projected through the initial WCS), so valid transforms have
+    # scale close to 1 and positive parity
     use_wcs_prior: bool = True
     scale_tolerance: float = 0.30  # fractional, e.g. 0.30 = +/-30%
     enforce_parity: bool = True
 
     # Two-stage scoring
-    stage1_n_det: int = 50  # cheap scoring uses only brightest subset of selected detections
+    stage1_n_det: int = 60  # cheap scoring uses only brightest subset of selected detections
     stage1_radius_arcsec: float = 20.0  # loose
     stage2_radius_arcsec: float = 8.0  # tighter
-    top_k_hypotheses: int = 60  # keep best hypotheses from stage 1
-    max_quads_tested: int = 5000  # max detection quads to try
+    top_k_hypotheses: int = 80  # keep best hypotheses from stage 1
+    max_quads_tested: int = 8000  # max detection quads to try
     max_candidates_per_bucket: int = 60  # cap ref candidates pulled per hash bucket
-
-    # Multi-probe hashing: probe only nearby bins instead of all (2r+1)^4
-    use_multiprobe: bool = True
 
     # Final fit
     sip_degree: int = 3
@@ -744,8 +708,10 @@ class AstrometryConfig:
     refine_n_ref: Optional[int] = None
     refine_match_radius_arcsec: Optional[float] = None
 
-    # Auto matching resolution: compute stage radii from source density
-    auto_match_resolution: bool = True
+    # Auto matching resolution: compute stage radii from source density.
+    # Disabled by default: the density-based inflation can produce very large
+    # radii for sparse wide-field images; prefer pixel-scale-aware radii.
+    auto_match_resolution: bool = False
 
     # Adaptive source count: retry with more sources if matching fails
     adaptive_n_retry: int = 2  # number of retry doublings (0 = disabled)
@@ -753,8 +719,8 @@ class AstrometryConfig:
 
 
 class QuadHashAstrometry:
-    def __init__(self, config: AstrometryConfig = AstrometryConfig()):
-        self.cfg = config
+    def __init__(self, config: Optional[AstrometryConfig] = None):
+        self.cfg = config if config is not None else AstrometryConfig()
 
     def _pattern_match(
         self,
@@ -762,7 +728,6 @@ class QuadHashAstrometry:
         det_mag: np.ndarray,
         ref_uv: np.ndarray,
         ref_mag: np.ndarray,
-        wcs_init: WCS,
         pixel_scale_arcsec: float,
         cfg: Optional['AstrometryConfig'] = None,
     ) -> Tuple[list, list, dict]:
@@ -773,40 +738,25 @@ class QuadHashAstrometry:
         """
         if cfg is None:
             cfg = self.cfg
-        # WCS prior: in pixel space expected scale ≈ 1.0, compute parity from WCS
+        # Hypothesis sanity checks: the catalogue is projected into pixel space
+        # with wcs_init, so the det->ref transform must have scale close to 1
+        # and preserve parity, regardless of the sky orientation of the WCS.
         expected_scale = None
         expected_parity = None  # sign of determinant
         if cfg.use_wcs_prior:
-            expected_scale = 1.0  # Both sets in pixel space
-            try:
-                crpix = np.asarray(wcs_init.wcs.crpix, dtype=np.float64)
-                if crpix.size == 2 and np.all(np.isfinite(crpix)):
-                    px = np.array([crpix[0], crpix[0] + 1.0, crpix[0]], dtype=np.float64)
-                    py = np.array([crpix[1], crpix[1], crpix[1] + 1.0], dtype=np.float64)
-                    ra_s, dec_s = wcs_init.all_pix2world(px, py, 1)
-                    x_s, y_s = wcs_init.all_world2pix(ra_s, dec_s, 0)
-                    J = np.array(
-                        [
-                            [x_s[1] - x_s[0], x_s[2] - x_s[0]],
-                            [y_s[1] - y_s[0], y_s[2] - y_s[0]],
-                        ],
-                        dtype=np.float64,
-                    )
-                    det_j = float(np.linalg.det(J))
-                    if np.isfinite(det_j) and det_j != 0:
-                        expected_parity = 1.0 if det_j > 0 else -1.0
-            except Exception:
-                expected_parity = None
+            expected_scale = 1.0
+            expected_parity = 1.0
 
         # --- Consistent baseline binning ---
         ref_qa = None
         ref_descs_raw = None
         ref_lens_raw = None
+        ref_order_raw = None
         ref_bin_edges = None
         ref_quads_raw = make_local_quads(ref_uv, k=cfg.neighbor_k)
         if ref_quads_raw:
             ref_qa = np.array(ref_quads_raw, dtype=np.int32)
-            ref_descs_raw, ref_lens_raw = quad_descriptor_batch(ref_uv, ref_qa)
+            ref_descs_raw, ref_lens_raw, ref_order_raw = quad_descriptor_batch(ref_uv, ref_qa)
             ok_ref = np.isfinite(ref_lens_raw) & (ref_lens_raw > 0)
             if np.any(ok_ref):
                 ref_bin_edges = compute_bin_edges(ref_lens_raw[ok_ref], cfg.n_scale_bins)
@@ -823,6 +773,7 @@ class QuadHashAstrometry:
             quad_array=ref_qa,
             descs=ref_descs_raw,
             lens=ref_lens_raw,
+            order=ref_order_raw,
         )
 
         # Detection quads
@@ -831,10 +782,15 @@ class QuadHashAstrometry:
             raise _PatternMatchFailed("Not enough detections for quad matching.")
 
         det_quad_array = np.array(det_quads, dtype=np.int32)
-        det_descs, det_lens = quad_descriptor_batch(det_xy, det_quad_array)
+        det_descs, det_lens, det_order = quad_descriptor_batch(det_xy, det_quad_array)
 
-        okq = np.isfinite(det_descs).all(axis=1) & np.isfinite(det_lens) & (det_lens > 0)
-        det_quads = det_quad_array[okq]
+        okq = (
+            np.isfinite(det_descs).all(axis=1)
+            & np.isfinite(det_lens)
+            & (det_lens > 0)
+            & np.all(det_order >= 0, axis=1)
+        )
+        det_order = det_order[okq]
         det_descs = det_descs[okq]
         det_lens = det_lens[okq]
 
@@ -842,10 +798,6 @@ class QuadHashAstrometry:
             det_bins = baseline_rank_bins(det_lens, n_bins=cfg.n_scale_bins, edges=ref_bin_edges)
         else:
             det_bins = baseline_rank_bins(det_lens, n_bins=cfg.n_scale_bins)
-
-        det_quads_quantized = np.array(
-            [quantize_desc(desc, cfg.eps_desc) for desc in det_descs], dtype=object
-        )
 
         ref_tree = cKDTree(ref_uv)
 
@@ -862,7 +814,7 @@ class QuadHashAstrometry:
 
         rng = np.random.default_rng(12345)
 
-        q_order = np.arange(len(det_quads))
+        q_order = np.arange(len(det_order))
         rng.shuffle(q_order)
         q_order = q_order[: min(cfg.max_quads_tested, len(q_order))]
 
@@ -877,35 +829,31 @@ class QuadHashAstrometry:
 
         # --- Stage 1 ---
         for qi in q_order:
-            q = det_quads[qi]
+            # Canonical (A, B, C, D) point order: a hash hit directly gives
+            # the det<->ref point correspondence for the similarity fit
+            q = det_order[qi]
             bin_id = int(det_bins[qi])
 
-            kdesc = det_quads_quantized[qi]
-
             candidates: List[QuadEntry] = []
-            if cfg.use_multiprobe:
-                for kdesc2 in multiprobe_desc_keys(det_descs[qi], cfg.eps_desc):
-                    kk = (bin_id, kdesc2)
-                    if kk in ref_hash:
-                        candidates.extend(ref_hash[kk])
-            else:
-                for kdesc2 in neighbors_bins(kdesc, r=cfg.bin_neighbor_radius):
-                    kk = (bin_id, kdesc2)
-                    if kk in ref_hash:
-                        candidates.extend(ref_hash[kk])
+            for kdesc2 in multiprobe_desc_keys(det_descs[qi], cfg.eps_desc):
+                kk = (bin_id, kdesc2)
+                if kk in ref_hash:
+                    candidates.extend(ref_hash[kk])
 
             if not candidates:
                 continue
 
-            det_sig = mag_signature(det_mag[q]) if cfg.use_mag_signature else None
+            det_quad_mags = det_mag[q] if cfg.use_mag_signature else None
+            P = det_xy[q]
 
             rng.shuffle(candidates)
             for ce in candidates[: cfg.max_candidates_per_bucket]:
-                if det_sig is not None and ce.mags is not None:
-                    if mag_signature(np.array(ce.mags)) != det_sig:
+                if det_quad_mags is not None and ce.mags is not None:
+                    if not mag_orderings_consistent(
+                        det_quad_mags, ce.mags, cfg.mag_tolerance
+                    ):
                         continue
 
-                P = det_xy[q]
                 Q = ref_uv[list(ce.idxs)]
 
                 try:
@@ -946,16 +894,7 @@ class QuadHashAstrometry:
         best = {"score": -1.0, "inliers": -1, "R": None, "t": None, "s": None, "pairs": None}
 
         for score1, R, t, s in top_hyp:
-            if expected_scale is not None and cfg.scale_tolerance is not None:
-                tol = float(cfg.scale_tolerance)
-                if tol >= 0:
-                    if not (expected_scale * (1 - tol) <= s <= expected_scale * (1 + tol)):
-                        continue
-            if expected_parity is not None and cfg.enforce_parity and cfg.allow_reflection:
-                detR = float(np.linalg.det(R))
-                if not np.isfinite(detR) or np.sign(detR) != expected_parity:
-                    continue
-
+            # Scale/parity filters already applied in stage 1
             det_uv = apply_similarity(det_xy, R, t, s)
 
             det_ids, ref_ids = _mutual_nearest_neighbor(det_uv, ref_uv, r2, tree_b=ref_tree)
@@ -1091,7 +1030,9 @@ class QuadHashAstrometry:
 
         n_retries = max(0, cfg.adaptive_n_retry)
         last_error = None
-        pairs = None
+        # Snapshot of the best attempt so far: pairs index into the det/ref
+        # subsets of the *same* attempt, so they must be kept together
+        matched = None
 
         for _attempt in range(n_retries + 1):
             scale_factor = 2**_attempt
@@ -1135,7 +1076,6 @@ class QuadHashAstrometry:
                     det_mag,
                     ref_uv,
                     ref_mag,
-                    wcs_init,
                     pixel_scale_arcsec,
                     cfg=cfg,
                 )
@@ -1145,6 +1085,16 @@ class QuadHashAstrometry:
                     continue
                 else:
                     break
+
+            matched = {
+                "pairs": pairs,
+                "top_hyp": top_hyp,
+                "best": best,
+                "det_xy": det_xy,
+                "ref_uv": ref_uv,
+                "obj_sub_idx": obj_sub_idx,
+                "cat_sub_idx": cat_sub_idx,
+            }
 
             # Check if we have enough inliers
             if len(pairs) >= cfg.adaptive_min_inliers:
@@ -1156,8 +1106,18 @@ class QuadHashAstrometry:
             if cur_n_det >= len(x) and cur_n_ref >= len(ra):
                 break  # can't add more sources
 
-        if pairs is None or len(pairs) < 8:
+        if matched is None or len(matched["pairs"]) < 8:
             raise RuntimeError(str(last_error) if last_error else "Pattern matching failed.")
+
+        # Restore the state of the attempt that produced the pairs (a later
+        # failed attempt may have overwritten the loop variables)
+        pairs = matched["pairs"]
+        top_hyp = matched["top_hyp"]
+        best = matched["best"]
+        det_xy = matched["det_xy"]
+        ref_uv = matched["ref_uv"]
+        obj_sub_idx = matched["obj_sub_idx"]
+        cat_sub_idx = matched["cat_sub_idx"]
 
         # Build match list for final fit
         pairs_arr = np.array(pairs, dtype=np.int32)
@@ -1274,7 +1234,8 @@ class QuadHashAstrometry:
             ref_ra_use = sky_use.ra.deg
             ref_dec_use = sky_use.dec.deg
             cos_dec = np.cos(np.deg2rad(0.5 * (dec_fit + ref_dec_use)))
-            dra_deg = (ra_fit - ref_ra_use) * cos_dec
+            # Wrap RA difference to [-180, 180) to handle fields crossing RA=0
+            dra_deg = ((ra_fit - ref_ra_use + 180.0) % 360.0 - 180.0) * cos_dec
             ddec_deg = dec_fit - ref_dec_use
             dr = np.deg2rad(np.hypot(dra_deg, ddec_deg))
 
@@ -1315,7 +1276,8 @@ class QuadHashAstrometry:
         # Residuals in arcsec using final WCS (spherical, projection-independent)
         ra_fit, dec_fit = refined_wcs.all_pix2world(match["x"], match["y"], 0)
         cos_dec_out = np.cos(np.deg2rad(0.5 * (dec_fit + _as_float_array(match["dec"]))))
-        match["du_arcsec"] = (ra_fit - _as_float_array(match["ra"])) * cos_dec_out * 3600.0
+        dra_out = (ra_fit - _as_float_array(match["ra"]) + 180.0) % 360.0 - 180.0
+        match["du_arcsec"] = dra_out * cos_dec_out * 3600.0
         match["dv_arcsec"] = (dec_fit - _as_float_array(match["dec"])) * 3600.0
         match["dr_arcsec"] = np.hypot(match["du_arcsec"], match["dv_arcsec"])
 
@@ -1375,8 +1337,7 @@ def refine_wcs_quadhash(
 
     Pure Python implementation of astrometric refinement using quad-hash based
     pattern matching with no external dependencies (only numpy, scipy, astropy).
-    Typically achieves sub-arcsecond accuracy; ~2–7× more accurate than SCAMP,
-    especially for challenging conditions, though ~4× slower.
+    Typically achieves sub-arcsecond accuracy.
 
     Parameters
     ----------
@@ -1438,7 +1399,8 @@ def refine_wcs_quadhash(
     allow_reflection : bool, optional
         Allow reflected quad matches. Default is True.
     use_wcs_prior : bool, optional
-        Use the initial WCS to filter hypotheses by scale/parity. Default is True.
+        Filter transform hypotheses by scale (close to 1) and parity consistency
+        in pixel space. Default is True.
     scale_tolerance : float, optional
         Fractional tolerance for scale filtering. Default is 0.30 (±30%).
     enforce_parity : bool, optional
@@ -1493,8 +1455,6 @@ def refine_wcs_quadhash(
 
     # Get WCS from header if needed
     if wcs is None and header is not None:
-        from astropy.io import fits
-
         wcs = WCS(header)
 
     if wcs is None or not wcs.is_celestial:
@@ -1582,8 +1542,11 @@ def refine_wcs_quadhash(
         _pixel_scale_deg = pixel_scale_arcsec / 3600.0
 
     # Estimate FOV diagonal in degrees for scaling source counts
-    nx = wcs.pixel_shape[0] if wcs.pixel_shape else 2048
-    ny = wcs.pixel_shape[1] if wcs.pixel_shape else 2048
+    if wcs.pixel_shape:
+        nx, ny = wcs.pixel_shape
+    else:
+        nx = ny = 2048
+        log("Warning: WCS has no pixel shape, assuming 2048x2048 for FOV-based scaling")
     fov_diag_deg = np.hypot(nx, ny) * _pixel_scale_deg
 
     # Scale-aware matching radii: ensure at least a few pixels even for coarse plates
@@ -1628,33 +1591,18 @@ def refine_wcs_quadhash(
     config = AstrometryConfig(
         n_det=scaled_n_det,
         n_ref=scaled_n_ref,
-        neighbor_k=10,
-        eps_desc=0.02,
-        n_scale_bins=6,
-        stage1_n_det=min(60, len(obj_std)),
         stage1_radius_arcsec=stage1_arcsec,
         stage2_radius_arcsec=stage2_arcsec,
-        top_k_hypotheses=80,
         max_quads_tested=max_quads_tested,
         allow_reflection=allow_reflection,
         use_wcs_prior=use_wcs_prior,
         scale_tolerance=scale_tolerance,
         enforce_parity=enforce_parity,
         sip_degree=max(0, min(5, order)),  # Clamp to 0-5
-        refine_clip_sigma=4.0,
-        refine_clip_sigma_start=5.0,
-        refine_min_match_fraction=0.5,
-        refine_max_iter=5,
-        refine_rematch_iters=2,
         refine_use_all=refine_use_all,
         refine_n_det=refine_n_det,
         refine_n_ref=refine_n_ref,
         refine_match_radius_arcsec=refine_match_radius_arcsec,
-        # Disable auto_match_resolution: the wrapper already computes
-        # pixel-scale-aware radii above, so the density-based inflation
-        # (which can produce absurdly large radii for sparse wide-field
-        # images) is not needed here.
-        auto_match_resolution=False,
     )
 
     try:
@@ -1687,7 +1635,7 @@ def refine_wcs_quadhash(
         return wcs_refined
 
     except Exception as e:
-        log(f"Refinement failed: {e}")
+        log(f"Refinement failed: {type(e).__name__}: {e}")
         if verbose:
             import traceback
 
