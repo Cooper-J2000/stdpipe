@@ -965,6 +965,9 @@ def run_sfft(
     max_iter=5,
     obj=None,
     obj_size=None,
+    obj_grid=4,
+    obj_per_cell=10,
+    obj_max_masked_fraction=0.5,
     get_convolved=False,
     get_scaled=False,
     get_noise=False,
@@ -999,7 +1002,10 @@ def run_sfft(
         and ``image_gain``.
     template_err : numpy.ndarray or bool, optional
         Template image noise map. If True, built from the template and
-        ``template_gain``.
+        ``template_gain``. Used both for the difference image noise map and
+        for fit weighting: the solver performs one reweighting pass with the
+        template variance propagated through the fitted kernel (see
+        :func:`stdpipe.sfft.solve`).
     image_gain : float, optional
         Gain of science image in e-/ADU.
     template_gain : float, optional
@@ -1021,31 +1027,55 @@ def run_sfft(
     max_iter : int, optional
         Maximum sigma-clipping iterations. Default 5.
     obj : astropy.table.Table, optional
-        List of detected objects with ``x``, ``y`` columns. If provided, kernel
-        fitting is restricted to rectangular regions around these objects, analogous
-        to HOTPANTS stamp placement. This concentrates the fit on high-S/N regions
-        and can improve kernel quality.
+        List of detected objects with ``x``, ``y`` columns (and optionally
+        ``flux``, ``fluxerr``, ``flags``, ``fwhm``). If provided, kernel
+        fitting is restricted to square regions around selected objects,
+        analogous to HOTPANTS stamp placement. This concentrates the fit on
+        high-S/N regions and can improve kernel quality. Objects with
+        nonzero ``flags`` are skipped, and the selection is spatially
+        stratified (see ``obj_grid`` / ``obj_per_cell``) so the kernel and
+        background spatial polynomials stay constrained across the field.
+        If the selected regions provide too few pixels for the model
+        parameters, the fit falls back to the whole image.
     obj_size : int, optional
         Half-size in pixels of the fitting region around each object. If None
         (default), derived from the median ``fwhm`` column of *obj*
         (``3 × median(fwhm)``), or 15 pixels if ``fwhm`` is not available.
+    obj_grid : int, optional
+        Number of grid cells per axis for spatially stratified object
+        selection. Default 4.
+    obj_per_cell : int, optional
+        Maximum number of objects used per grid cell, highest S/N first
+        (``flux``/``fluxerr``, or ``flux``, or input order). Default 10.
+        Set to None to disable the per-cell cap.
+    obj_max_masked_fraction : float, optional
+        Maximum fraction of masked pixels allowed in an object region;
+        regions above it are skipped. Default 0.5. Isolated masked pixels
+        within accepted regions are harmless — the fit excludes them
+        individually via the weight map.
     get_convolved : bool, optional
         Whether to also return the convolved template.
     get_scaled : bool, optional
-        Whether to also return noise-normalized difference.
+        Whether to also return noise-normalized difference. Pixels where the
+        difference is unreliable (image edges and kernel-footprint
+        neighbourhoods of template defects, see
+        :attr:`stdpipe.sfft.SFFTResult.dmask`) are set to zero.
     get_noise : bool, optional
         Whether to also return the difference image noise map.
     get_kernel : bool, optional
         Whether to also return the :class:`~stdpipe.sfft.SFFTResult` object
-        containing kernel coefficients and fit metadata.
+        containing kernel coefficients, fit metadata, and the ``dmask``
+        attribute flagging unreliable difference pixels.
     verbose : bool or callable, optional
         Whether to show verbose messages.
 
     Returns
     -------
     numpy.ndarray or list
-        The difference image, or a list ``[diff, ...]`` if any ``get_*`` option
-        is set.
+        The difference image, or a list of requested planes in the same
+        order as :func:`run_hotpants`:
+        ``[diff, convolved, scaled, noise, kernel]``, with unrequested
+        planes omitted.
     """
 
     # Simple wrapper around print for logging in verbose mode only
@@ -1090,15 +1120,16 @@ def run_sfft(
     elif template_err is not None:
         template_err = np.asarray(template_err, dtype=np.float64)
 
-    # Build combined weight map for SFFT solver
-    # SFFT uses inverse-variance weighting internally when err is provided
-    # We pass the science err to weight the fit
+    # SFFT uses inverse-variance weighting internally when err is provided;
+    # template_err additionally triggers a reweighting pass with template
+    # noise propagated through the fitted kernel
     sfft_err = err  # may be None for uniform weighting
 
     # --- Build fitting mask from object positions ---
     fitting_mask = combined_mask
     if obj is not None and len(obj):
         obj = Table(obj)
+        ny_img, nx_img = image.shape[:2]
 
         # Determine region half-size
         if obj_size is not None:
@@ -1108,30 +1139,76 @@ def run_sfft(
         else:
             size = 15
 
-        # Build good-regions map
+        # Reject objects with detection quality flags (saturation, blending,
+        # truncation, ...) — they should not constrain the kernel
+        if 'flags' in obj.colnames:
+            n_before = len(obj)
+            obj = obj[np.asarray(obj['flags']) == 0]
+            if len(obj) < n_before:
+                log('Rejected %d flagged objects out of %d' % (n_before - len(obj), n_before))
+
+        # Order by S/N, brightest first, for the per-cell selection
+        if 'flux' in obj.colnames:
+            flux = np.asarray(obj['flux'], dtype=np.float64)
+            if 'fluxerr' in obj.colnames:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    sn = flux / np.asarray(obj['fluxerr'], dtype=np.float64)
+            else:
+                sn = flux
+            order = np.argsort(-np.nan_to_num(sn, nan=-np.inf))
+        else:
+            order = np.arange(len(obj))
+
+        # Spatially stratified selection: up to obj_per_cell highest-S/N
+        # objects per grid cell, so that the kernel and background spatial
+        # polynomials are constrained across the whole field
+        grid = max(1, int(obj_grid)) if obj_grid else 1
+        cell_counts = np.zeros((grid, grid), dtype=int)
+
         good_regions = np.zeros(image.shape[:2], dtype=bool)
-        ny_img, nx_img = image.shape[:2]
         n_used = 0
 
-        for row in obj:
-            x0 = int(row['x'])
-            y0 = int(row['y'])
+        for i in order:
+            row = obj[int(i)]
+            x0 = int(round(row['x']))
+            y0 = int(round(row['y']))
 
             # Skip objects too close to edges
             if x0 < size or x0 >= nx_img - size or y0 < size or y0 >= ny_img - size:
                 continue
 
-            # Skip regions containing masked pixels
-            region_mask = combined_mask[y0 - size : y0 + size, x0 - size : x0 + size]
-            if np.any(region_mask):
+            cell = (min(y0 * grid // ny_img, grid - 1), min(x0 * grid // nx_img, grid - 1))
+            if obj_per_cell and cell_counts[cell] >= obj_per_cell:
                 continue
 
-            good_regions[y0 - size : y0 + size, x0 - size : x0 + size] = True
+            # Skip regions dominated by masked pixels; isolated masked pixels
+            # are harmless as the fit excludes them individually via weights
+            region_mask = combined_mask[y0 - size : y0 + size + 1, x0 - size : x0 + size + 1]
+            if np.mean(region_mask) > obj_max_masked_fraction:
+                continue
+
+            good_regions[y0 - size : y0 + size + 1, x0 - size : x0 + size + 1] = True
+            cell_counts[cell] += 1
             n_used += 1
 
-        if n_used > 0:
-            log('Using %d object regions (%d px half-size) for kernel fitting' % (n_used, size))
+        # Restrict the fit only if the regions provide enough pixels for the
+        # number of model parameters; otherwise fall back to the whole image
+        n_params = kernel_shape[0] * kernel_shape[1] * sfft_module._n_poly(
+            kernel_poly_order
+        ) + sfft_module._n_poly(bg_poly_order)
+        n_region_pixels = int(np.sum(good_regions & ~combined_mask))
+
+        if n_used > 0 and n_region_pixels >= 10 * n_params:
+            log(
+                'Using %d object regions (%d px half-size, %d good pixels) '
+                'for kernel fitting' % (n_used, size, n_region_pixels)
+            )
             fitting_mask = combined_mask | ~good_regions
+        elif n_used > 0:
+            log(
+                'Object regions provide only %d good pixels for %d parameters, '
+                'fitting on whole image' % (n_region_pixels, n_params)
+            )
         else:
             log('No usable object regions, fitting on whole image')
 
@@ -1142,7 +1219,9 @@ def run_sfft(
         image_f,
         template_f,
         mask=fitting_mask,
+        template_mask=template_mask,
         err=sfft_err,
+        template_err=template_err,
         kernel_shape=kernel_shape,
         kernel_poly_order=kernel_poly_order,
         bg_poly_order=bg_poly_order,
@@ -1175,15 +1254,18 @@ def run_sfft(
 
     if get_noise or get_scaled:
         noise = _compute_diff_noise(sfft_result, err, template_err, combined_mask, log)
-        if get_noise:
-            result.append(noise)
 
     # --- Noise-scaled difference ---
     if get_scaled:
         scaled = np.zeros_like(diff)
-        good = (noise > 0) & np.isfinite(noise) & ~combined_mask
+        # dmask covers image edges and kernel-footprint neighbourhoods of
+        # template defects, where the difference is unreliable
+        good = (noise > 0) & np.isfinite(noise) & ~combined_mask & ~sfft_result.dmask
         scaled[good] = diff[good] / noise[good]
         result.append(scaled)
+
+    if get_noise:
+        result.append(noise)
 
     # --- Kernel info ---
     if get_kernel:
@@ -1224,24 +1306,12 @@ def _compute_diff_noise(sfft_result, err, template_err, mask, log):
         var_tmpl = template_err**2
 
         # var_convolved = Σ_α a_α²(x,y) · var_tmpl_shifted(x,y)
-        ky, kx = sfft_result.kernel_shape
-        offsets = sfft_module._kernel_offsets(ky, kx)
-        n_kpoly = sfft_module._n_poly(sfft_result.kernel_poly_order)
-        x_norm, y_norm = sfft_module._norm_coords(ny, nx)
-        poly_k = sfft_module._poly_terms_2d(x_norm, y_norm, sfft_result.kernel_poly_order)
-
-        # Compute a_α(x,y) maps = kernel_coeffs[α] @ poly_k
-        kernel_coeffs = sfft_result.kernel_coeffs  # (n_kernel, n_kpoly)
-        poly_k_flat = poly_k.reshape(n_kpoly, ny * nx)
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            a_maps = kernel_coeffs @ poly_k_flat  # (n_kernel, npix)
-
-        var_conv = np.zeros(ny * nx, dtype=np.float64)
-        for alpha, (dy, dx) in enumerate(offsets):
-            shifted_var = sfft_module._shift_image(var_tmpl, dy, dx).ravel()
-            var_conv += a_maps[alpha] ** 2 * shifted_var
-
-        var_conv = var_conv.reshape(ny, nx)
+        var_conv = sfft_module._propagate_template_variance(
+            sfft_result.kernel_coeffs,
+            sfft_result.kernel_shape,
+            sfft_result.kernel_poly_order,
+            var_tmpl,
+        )
         var_total = var_sci + var_conv
     else:
         var_total = var_sci

@@ -90,8 +90,8 @@ The kernel at each pixel is modelled as a delta-function basis with polynomial s
                 image_gain=gain, template_gain=1e6,
                 verbose=True)
 
-   # Get all output planes (like HOTPANTS)
-   diff, conv, noise, scaled, sfft_result = subtraction.run_sfft(image, tmpl,
+   # Get all output planes (same order as run_hotpants)
+   diff, conv, scaled, noise, sfft_result = subtraction.run_sfft(image, tmpl,
                 mask=mask, template_mask=tmask,
                 err=True, template_err=True,
                 image_gain=gain, template_gain=1e6,
@@ -102,9 +102,11 @@ The kernel at each pixel is modelled as a delta-function basis with polynomial s
    # Now we have:
    # - `diff` for the difference image
    # - `conv` for the template convolved to match the science image
-   # - `noise` for the per-pixel noise map of the difference image
    # - `scaled` for the noise-normalized difference image (diff / noise)
+   # - `noise` for the per-pixel noise map of the difference image
    # - `sfft_result` for the full SFFTResult with kernel coefficients and metadata
+   #   (its `dmask` attribute flags unreliable difference pixels: image edges
+   #   and kernel-footprint neighbourhoods of template defects)
 
    # Inspect the spatially varying kernel at a specific position
    from stdpipe import sfft

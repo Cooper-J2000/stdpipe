@@ -268,7 +268,7 @@ class TestSFFTSolve:
         )
 
     def test_err_true(self, image_pair):
-        """err=True auto-estimates noise from the image."""
+        """err=True is accepted (equivalent to uniform weighting)."""
         from stdpipe.sfft import solve
 
         science, template, mask, _ = image_pair
@@ -340,6 +340,134 @@ class TestSFFTSolve:
             bg_poly_order=1, max_iter=1, verbose=False,
         )
         assert np.isfinite(r.rms)
+
+    def test_template_err_reweighting(self, image_pair):
+        """template_err triggers one extra reweighting pass and changes
+        the solution."""
+        from stdpipe.sfft import solve
+
+        science, template, mask, info = image_pair
+        err = np.full_like(science, 20.0)
+        # Per-pixel (Poisson-like) template noise so the reweighting is
+        # spatially non-trivial
+        terr = np.sqrt(np.clip(template, 1, None) / info['gain'])
+
+        r0 = solve(
+            science, template, mask=mask, err=err,
+            kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=2, verbose=False,
+        )
+        r1 = solve(
+            science, template, mask=mask, err=err, template_err=terr,
+            kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=2, verbose=False,
+        )
+        assert r1.n_iter == r0.n_iter + 1
+        assert np.isfinite(r1.rms)
+        assert not np.allclose(r0.kernel_coeffs, r1.kernel_coeffs)
+
+    def test_template_err_negligible_matches_science_only(self, image_pair):
+        """Vanishing template noise reproduces the science-only weighting."""
+        from stdpipe.sfft import solve
+
+        science, template, mask, _ = image_pair
+        err = np.full_like(science, 20.0)
+
+        r0 = solve(
+            science, template, mask=mask, err=err,
+            kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=1, verbose=False,
+        )
+        r1 = solve(
+            science, template, mask=mask, err=err,
+            template_err=np.full_like(science, 1e-9),
+            kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=1, verbose=False,
+        )
+        assert np.allclose(r0.kernel_coeffs, r1.kernel_coeffs, rtol=1e-6, atol=1e-12)
+
+    def test_template_err_without_err(self, image_pair):
+        """template_err with err=None estimates a constant science noise floor."""
+        from stdpipe.sfft import solve
+
+        science, template, mask, info = image_pair
+        terr = np.sqrt(np.clip(template, 1, None) / info['gain'])
+
+        r = solve(
+            science, template, mask=mask, template_err=terr,
+            kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=2, verbose=False,
+        )
+        assert np.isfinite(r.rms)
+
+    def test_incremental_matches_full_reassembly(self, image_pair, monkeypatch):
+        """Incremental downdating of clipped pixels is exact (matches full
+        reassembly up to floating-point roundoff)."""
+        import stdpipe.sfft as sfft_module
+        from stdpipe.sfft import solve
+
+        science, template, mask, _ = image_pair
+        # Inject outliers so clipping definitely triggers
+        science = science.copy()
+        rng = np.random.RandomState(3)
+        cy = rng.randint(10, science.shape[0] - 10, 40)
+        cx = rng.randint(10, science.shape[1] - 10, 40)
+        science[cy, cx] += 5000.0
+
+        kw = dict(
+            mask=mask, kernel_shape=(5, 5), kernel_poly_order=1,
+            bg_poly_order=1, sigma_clip=3.0, max_iter=4, verbose=False,
+        )
+        r_inc = solve(science, template, **kw)
+        monkeypatch.setattr(sfft_module, '_USE_INCREMENTAL_UPDATES', False)
+        r_full = solve(science, template, **kw)
+
+        assert r_inc.n_iter > 1  # clipping actually iterated
+        assert r_inc.n_good == r_full.n_good
+        scale = np.abs(r_full.kernel_coeffs).max()
+        assert np.allclose(
+            r_inc.kernel_coeffs, r_full.kernel_coeffs,
+            rtol=0, atol=1e-8 * scale,
+        )
+
+    def test_dmask_edges(self, sfft_result_basic):
+        """Edge bands within the kernel half-width are flagged in dmask."""
+        d = sfft_result_basic.dmask
+        assert d is not None
+        assert d.dtype == bool
+        # Kernel (7, 7) -> half-width 3
+        assert d[:3, :].all() and d[-3:, :].all()
+        assert d[:, :3].all() and d[:, -3:].all()
+
+    def test_dmask_template_defect_grown(self, image_pair):
+        """Template defects are grown by the kernel footprint in dmask
+        and excluded from the fit."""
+        from stdpipe.sfft import solve
+
+        science, template, mask, _ = image_pair
+        tmpl = template.copy()
+        tmpl[100:105, 120:125] = np.nan
+
+        r = solve(
+            science, tmpl, mask=mask,
+            kernel_shape=(7, 7), kernel_poly_order=1,
+            bg_poly_order=1, max_iter=1, verbose=False,
+        )
+        # Defect grown by kernel half-width (3 px) must be flagged
+        assert r.dmask[97:108, 117:128].all()
+        # Pixels well away from the defect are not flagged
+        assert not r.dmask[50, 50]
+        # The fit itself stays sane
+        assert np.isfinite(r.rms)
+        assert not np.any(np.isnan(r.diff))
+
+    def test_max_iter_invalid_raises(self, image_pair):
+        """max_iter < 1 raises ValueError instead of crashing."""
+        from stdpipe.sfft import solve
+
+        science, template, mask, _ = image_pair
+        with pytest.raises(ValueError, match="max_iter"):
+            solve(science, template, max_iter=0)
 
     def test_even_kernel_raises(self, image_pair):
         """Even kernel dimensions raise ValueError."""
@@ -478,6 +606,26 @@ class TestRunSFFTWrapper:
         )
         assert isinstance(diff, np.ndarray)
 
+    def test_template_err_used_for_weighting(self, image_pair):
+        """template_err is passed to the solver and triggers the
+        reweighting pass."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template, mask, info = image_pair
+        diff0, res0 = run_sfft(
+            science, template, mask=mask,
+            err=True, image_gain=info['gain'],
+            max_iter=2, get_kernel=True, verbose=False,
+        )
+        diff1, res1 = run_sfft(
+            science, template, mask=mask,
+            err=True, template_err=True,
+            image_gain=info['gain'], template_gain=info['gain'] * 5,
+            max_iter=2, get_kernel=True, verbose=False,
+        )
+        # One extra solver pass for the reweighting
+        assert res1.n_iter == res0.n_iter + 1
+
     def test_err_array(self, image_pair):
         """Providing err as an array works."""
         from stdpipe.subtraction import run_sfft
@@ -588,6 +736,23 @@ class TestRunSFFTWrapper:
         scatter = mad_std(valid)
         assert 0.5 < scatter < 1.5
 
+    def test_scaled_excludes_template_defect_ring(self, image_pair):
+        """Scaled difference is zeroed within the kernel footprint of
+        template defects (no spurious high-significance rings)."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template, mask, info = image_pair
+        tmpl = template.copy()
+        tmpl[100:105, 120:125] = np.nan
+
+        diff, scaled = run_sfft(
+            science, tmpl, mask=mask,
+            err=True, image_gain=info['gain'],
+            get_scaled=True, verbose=False,
+        )
+        # Defect grown by kernel half-width (3 px for the default 7x7 kernel)
+        assert np.all(scaled[97:108, 117:128] == 0)
+
     def test_get_convolved(self, image_pair):
         """get_convolved=True returns [diff, convolved_template]."""
         from stdpipe.subtraction import run_sfft
@@ -635,9 +800,9 @@ class TestRunSFFTWrapper:
             get_scaled=True, get_kernel=True,
             verbose=False,
         )
-        # Order: diff, convolved, noise, scaled, kernel
+        # Order matches run_hotpants: diff, convolved, scaled, noise, kernel
         assert len(result) == 5
-        diff, conv, noise, scaled, sfft_res = result
+        diff, conv, scaled, noise, sfft_res = result
         assert diff.shape == science.shape
         assert conv.shape == science.shape
         assert noise.shape == science.shape
@@ -741,6 +906,134 @@ class TestRunSFFTWrapper:
                 snr = diff[iy, ix] / noise[iy, ix]
                 # Transient should be clearly detected (> 3 sigma)
                 assert snr > 3, f"Transient at ({tx:.0f},{ty:.0f}) SNR={snr:.1f}"
+
+
+# ============================================================================
+# Tests: object-region selection in run_sfft
+# ============================================================================
+
+class TestObjectRegionSelection:
+    """Tests for stamp selection around detected objects in run_sfft."""
+
+    # Small kernel/poly so a single stamp passes the pixel-budget check
+    KW = dict(
+        kernel_shape=(3, 3), kernel_poly_order=0, bg_poly_order=0,
+        flux_poly_order=0, max_iter=1, get_kernel=True, verbose=False,
+    )
+
+    @staticmethod
+    def _noise_pair(size=128, seed=5):
+        rng = np.random.RandomState(seed)
+        science = rng.normal(1000, 10, (size, size))
+        template = rng.normal(1000, 10, (size, size))
+        return science, template
+
+    @staticmethod
+    def _make_obj(xs, ys, fluxes=None, flags=None):
+        from astropy.table import Table
+
+        t = Table()
+        t['x'] = np.atleast_1d(xs).astype(np.float64)
+        t['y'] = np.atleast_1d(ys).astype(np.float64)
+        t['flux'] = (
+            np.atleast_1d(fluxes).astype(np.float64)
+            if fluxes is not None
+            else np.full(len(t), 1000.0)
+        )
+        t['fluxerr'] = np.full(len(t), 10.0)
+        if flags is not None:
+            t['flags'] = np.atleast_1d(flags)
+        return t
+
+    def test_regions_restrict_fit(self):
+        """A single object region restricts the fit to its stamp."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        obj = self._make_obj([64], [64])
+
+        _, res = run_sfft(science, template, obj=obj, obj_size=12, **self.KW)
+        # Stamp is (2*12+1)² pixels, fully interior and unmasked
+        assert res.n_good == 25 * 25
+
+        _, res_full = run_sfft(science, template, **self.KW)
+        assert res_full.n_good == 126 * 126  # whole image minus 1-px edge band
+
+    def test_flagged_objects_skipped(self):
+        """Objects with nonzero flags are not used; with none left, the fit
+        falls back to the whole image."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        obj = self._make_obj([64], [64], flags=[0x4])
+
+        _, res = run_sfft(science, template, obj=obj, obj_size=12, **self.KW)
+        assert res.n_good == 126 * 126  # whole-image fallback
+
+    def test_masked_pixels_tolerated(self):
+        """A region containing a few masked pixels is used; the masked
+        pixels themselves are excluded from the fit."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        mask = np.zeros(science.shape, dtype=bool)
+        mask[60:61, 60:65] = True  # 5 masked pixels inside the stamp
+        obj = self._make_obj([64], [64])
+
+        _, res = run_sfft(science, template, mask=mask, obj=obj, obj_size=12, **self.KW)
+        assert res.n_good == 25 * 25 - 5
+
+    def test_mostly_masked_region_rejected(self):
+        """A region dominated by masked pixels is skipped (fallback to
+        whole image here, as it was the only object)."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        mask = np.zeros(science.shape, dtype=bool)
+        mask[52:77, 52:69] = True  # ~68% of the 25x25 stamp
+        obj = self._make_obj([64], [64])
+
+        _, res = run_sfft(science, template, mask=mask, obj=obj, obj_size=12, **self.KW)
+        # Whole image minus edge band minus the masked block
+        assert res.n_good == 126 * 126 - 25 * 17
+
+    def test_per_cell_cap(self):
+        """At most obj_per_cell objects are used per grid cell,
+        highest S/N first."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        # Five objects, all within one 32-px cell of the 4x4 grid
+        xs = [70, 70, 88, 88, 79]
+        ys = [70, 88, 70, 88, 79]
+        obj = self._make_obj(xs, ys, fluxes=[100, 200, 300, 400, 500])
+
+        _, res_capped = run_sfft(
+            science, template, obj=obj, obj_size=6, obj_per_cell=2, **self.KW
+        )
+        _, res_uncapped = run_sfft(
+            science, template, obj=obj, obj_size=6, obj_per_cell=None, **self.KW
+        )
+        # Two 13x13 stamps at (79,79) and (88,88) — the highest-flux ones —
+        # overlap by 4x4 pixels
+        assert res_capped.n_good == 2 * 13 * 13 - 4 * 4
+        assert res_capped.n_good < res_uncapped.n_good
+
+    def test_fail_soft_insufficient_pixels(self):
+        """If regions provide too few pixels for the model parameters,
+        the fit falls back to the whole image instead of failing."""
+        from stdpipe.subtraction import run_sfft
+
+        science, template = self._noise_pair()
+        obj = self._make_obj([64], [64])
+
+        # Default kernel (7,7) poly 2 needs 300 parameters; a single
+        # 17x17 stamp is far below the 10x pixel budget
+        _, res = run_sfft(
+            science, template, obj=obj, obj_size=8,
+            max_iter=1, get_kernel=True, verbose=False,
+        )
+        assert res.n_good == 122 * 122  # whole image minus 3-px edge band
 
 
 # ============================================================================
