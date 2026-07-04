@@ -410,6 +410,9 @@ def match(
 
         - ``oidx``, ``cidx``, ``dist`` -- indices of positionally matched
           objects and catalogue stars, and their pairwise distances in degrees.
+          The matching is one-to-one: if several catalogue stars fall within
+          the radius of one object (or vice versa), only closest pairs are
+          kept.
         - ``omag``, ``omag_err``, ``cmag``, ``cmag_err`` -- instrumental
           magnitudes of matched objects, corresponding catalogue magnitudes,
           and their errors. Array lengths equal the number of positional
@@ -426,6 +429,9 @@ def match(
           the fit.
         - ``color_term`` -- fitted color term. Instrumental photometric system
           is defined as ``obj_mag = cat_mag - color * color_term``.
+        - ``color_term_err`` -- uncertainty of the fitted color term, with the
+          same structure as ``color_term``. None if the color term is not
+          fitted (disabled or fixed through ``force_color_term``).
         - ``zero_fn`` -- function to compute the zero point (without color
           term) at a given position and for a given instrumental magnitude,
           and optionally its error.
@@ -477,6 +483,29 @@ def match(
         len(cat_ra),
         'catalogue stars, sr = %.2f arcsec' % (sr * 3600),
     )
+
+    if not len(dist):
+        log('No matches between objects and catalogue stars')
+        return None
+
+    # Spherical matching returns all pairs inside the radius, so one object may
+    # be paired with several catalogue stars and vice versa. Resolve it by
+    # greedily keeping closest pairs so that every object and every catalogue
+    # star appears at most once
+    if len(np.unique(oidx)) < len(oidx) or len(np.unique(cidx)) < len(cidx):
+        o_used = np.zeros(np.max(oidx) + 1, dtype=bool)
+        c_used = np.zeros(np.max(cidx) + 1, dtype=bool)
+        keep = np.zeros(len(dist), dtype=bool)
+
+        for i in np.argsort(dist):
+            if not o_used[oidx[i]] and not c_used[cidx[i]]:
+                keep[i] = True
+                o_used[oidx[i]] = True
+                c_used[cidx[i]] = True
+
+        oidx, cidx, dist = oidx[keep], cidx[keep], dist[keep]
+        log('Kept %d unique closest pairs after resolving duplicate matches' % len(dist))
+
     log('Median separation is %.2f arcsec' % (np.median(dist) * 3600))
 
     omag = np.asarray(np.ma.filled(obj_mag[oidx], fill_value=np.nan), dtype=float)
@@ -562,6 +591,7 @@ def match(
         & np.isfinite(omag_err)
         & np.isfinite(cmag)
         & np.isfinite(cmag_err)
+        & (zero_err > 0)  # Zero errors would give infinite weights in the fit
         & ((oflags & ~accept_flags) == 0)
     )  # initial mask
     if cat_color is not None and (fit_color_term or force_color_term is not None):
@@ -579,6 +609,28 @@ def match(
     scale_err = 1
     total_err = zero_err
 
+    def run_fit():
+        """Single robust or weighted fit with current mask and noise model."""
+        if robust:
+            # Rescale the arguments with weights
+            C = _StableRLM(zero[idx] / total_err[idx], (X[idx].T / total_err[idx]).T).fit()
+        else:
+            C = sm.WLS(zero[idx], X[idx], weights=1 / total_err[idx] ** 2).fit()
+
+        # Perfect fit is fatal for RLM iterations, and whenever the scale
+        # is used for re-scaling the noise model
+        if not np.isfinite(C.scale) or (C.scale == 0.0 and (robust or scale_noise)):
+            log('Fit failed - fit scale collapsed to zero, model is degenerate')
+            return None
+
+        # RLM scale is a standard deviation while WLS one is a variance
+        fit_scale = float(C.scale) if robust else float(np.sqrt(C.scale))
+
+        return C, fit_scale
+
+    converged = False
+    total_err_fit = None
+
     for iter in range(niter):
         if np.sum(idx) < Nparams + 1:
             log(
@@ -587,18 +639,19 @@ def match(
             )
             return None
 
-        if robust:
-            # Rescale the arguments with weights
-            C = _StableRLM(zero[idx] / total_err[idx], (X[idx].T / total_err[idx]).T).fit()
-            if C.scale == 0.0 or not np.isfinite(C.scale):
-                log('Fit failed - RLM scale collapsed to zero, model is degenerate')
-                return None
-        else:
-            C = sm.WLS(zero[idx], X[idx], weights=1 / total_err[idx] ** 2).fit()
+        total_err_fit = total_err  # Noise model actually used in this fit
+
+        fit = run_fit()
+        if fit is None:
+            return None
+        C, fit_scale = fit
 
         zero_model = np.sum(X * C.params, axis=1)
 
-        scale_err = 1 if not scale_noise else np.sqrt(C.scale)  # rms
+        if scale_noise:
+            # The fit scale measures residual scatter relative to the noise
+            # model used in this fit, so the applied scaling is cumulative
+            scale_err = scale_err * fit_scale
 
         intrinsic_rms = (
             get_intrinsic_scatter((zero - zero_model)[idx], (zero_err * scale_err)[idx], max=max_intrinsic_rms)
@@ -609,7 +662,7 @@ def match(
         total_err = np.hypot(zero_err * scale_err, intrinsic_rms)
 
         if threshold:
-            idx1 = np.abs((zero - zero_model) / total_err)[idx] < threshold
+            idx1 = np.abs((zero - zero_model)[idx] / total_err[idx]) < threshold
         else:
             idx1 = np.ones_like(idx[idx])
 
@@ -626,16 +679,39 @@ def match(
             '- normed',
             '%.2f' % np.std((zero - zero_model)[idx] / zero_err[idx]),
             '%.2f' % np.std((zero - zero_model)[idx] / total_err[idx]),
-            '- scale %.2f %.2f' % (np.sqrt(C.scale), scale_err),
+            '- scale %.2f %.2f' % (fit_scale, scale_err),
             '- rms',
             '%.2f' % intrinsic_rms,
         )
 
         if not np.sum(~idx1):  # and new_intrinsic_rms <= intrinsic_rms:
             log('Fitting converged')
+            converged = True
             break
         else:
             idx[idx] &= idx1
+
+    # Refit once more if the mask was updated after the last fit, or if the
+    # noise model changed, so that the returned model is consistent with them
+    if not converged or total_err_fit is None or not np.array_equal(total_err, total_err_fit):
+        if np.sum(idx) < Nparams + 1:
+            log(
+                "Fit failed - %d objects remaining for fitting %d parameters"
+                % (np.sum(idx), Nparams)
+            )
+            return None
+
+        fit = run_fit()
+        if fit is None:
+            return None
+        C, fit_scale = fit
+
+        zero_model = np.sum(X * C.params, axis=1)
+
+        if max_intrinsic_rms > 0:
+            intrinsic_rms = get_intrinsic_scatter(
+                (zero - zero_model)[idx], (zero_err * scale_err)[idx], max=max_intrinsic_rms
+            )
 
     log(np.sum(idx), 'good matches')
     if max_intrinsic_rms > 0:
@@ -688,15 +764,19 @@ def match(
     if cat_color is not None and (fit_color_term or force_color_term is not None):
         if fit_color_term:
             color_term = list(C.params[pos_color:][: int(fit_color_term)])
+            color_term_err = list(np.sqrt(np.diag(cov_p))[pos_color:][: int(fit_color_term)])
             if len(color_term) == 1:
                 color_term = color_term[0]
+                color_term_err = color_term_err[0]
 
             log('Color term is', format_color_term(color_term))
         elif force_color_term is not None:
             color_term = force_color_term
+            color_term_err = None
             log('Color term (fixed) is', format_color_term(color_term))
     else:
         color_term = None
+        color_term_err = None
 
     return {
         'oidx': oidx,
@@ -708,13 +788,16 @@ def match(
         'cmag_err': cmag_err,
         'color': ccolor,
         'color_term': color_term,
+        'color_term_err': color_term_err,
         'zero': zero,
         'zero_err': zero_err,
         'zero_model': zero_model,
         'zero_model_err': zero_model_err,
         'zero_fn': zero_fn,
         'params': C.params,
-        'error_scale': np.sqrt(C.scale),
+        # Total measured noise mismatch: already applied scaling (1 unless
+        # scale_noise is set) times the residual scale of the final fit
+        'error_scale': scale_err * fit_scale,
         'intrinsic_rms': intrinsic_rms,
         'obj_zero': zero_fn(obj_x, obj_y, mag=obj_mag),
         'ox': ox,
@@ -729,7 +812,8 @@ def make_sn_model(mag, sn):
     """Build a model for signal to noise (S/N) ratio versus magnitude.
 
     Assumes the noise comes from constant background noise plus Poissonian
-    noise with constant gain.
+    noise with constant gain, plus a constant systematic floor (flat-fielding,
+    scintillation etc) that limits the S/N of bright stars.
 
     Parameters
     ----------
@@ -757,23 +841,30 @@ def make_sn_model(mag, sn):
         raise ValueError('No finite positive S/N values to build the model')
 
     def sn_fn(p, mag):
-        return 1 / np.sqrt(p[0] * 10 ** (0.8 * mag) + p[1] * 10 ** (0.4 * mag))
+        # Background-limited, Poisson-limited, and constant floor terms
+        return 1 / np.sqrt(p[0] * 10 ** (0.8 * mag) + p[1] * 10 ** (0.4 * mag) + p[2])
 
-    def lstsq_fn(p, x, y):
-        # Minimize residuals in logarithms, for better stability
-        return np.log10(y) - np.log10(sn_fn(p, x))
+    def lstsq_fn(q, x, y):
+        # Minimize residuals in logarithms, for better stability. Params are
+        # also fitted in logarithms as they span many decades, and it keeps
+        # them positive so that the model stays finite and monotonic
+        return np.log10(y) - np.log10(sn_fn(10.0 ** np.asarray(q), x))
 
     aidx = np.argsort(sn)
 
-    # Initial params from two limiting cases, one on average and one on brightest point
-    x = [
-        np.median(10 ** (-0.8 * mag) / sn**2),
-        10 ** (-0.4 * mag[aidx][-1]) / sn[aidx][-1] ** 2,
-    ]
+    # Initial params from limiting cases: background-limited on average,
+    # Poisson-limited at the brightest point, and floor from the highest S/N
+    x = np.log10(
+        [
+            np.median(10 ** (-0.8 * mag) / sn**2),
+            10 ** (-0.4 * mag[aidx][-1]) / sn[aidx][-1] ** 2,
+            0.5 / sn[aidx][-1] ** 2,
+        ]
+    )
 
     res = least_squares(lstsq_fn, x, args=(mag, sn), method='lm')
 
-    return lambda mag: sn_fn(res.x, mag)
+    return lambda mag: sn_fn(10.0**res.x, mag)
 
 
 def get_detection_limit_sn(mag, mag_sn, sn=5, get_model=False, verbose=True):

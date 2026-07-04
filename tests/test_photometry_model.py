@@ -262,6 +262,20 @@ class TestSnModel:
         np.testing.assert_allclose(model(mag), sn, rtol=5e-2, atol=1e-4)
 
     @pytest.mark.unit
+    def test_make_sn_model_with_floor(self):
+        mag = np.linspace(10.0, 20.0, 100)
+        p0 = 1.0e-14
+        p1 = 1.0e-8
+        p2 = 1.0e-4  # S/N saturates at 100 for bright stars
+        sn = 1.0 / np.sqrt(p0 * 10 ** (0.8 * mag) + p1 * 10 ** (0.4 * mag) + p2)
+
+        model = photometry_model.make_sn_model(mag, sn)
+
+        np.testing.assert_allclose(model(mag), sn, rtol=5e-2)
+        # Bright end must saturate at 1/sqrt(p2) instead of growing indefinitely
+        assert np.isclose(model(5.0), 1.0 / np.sqrt(p2), rtol=5e-2)
+
+    @pytest.mark.unit
     def test_get_detection_limit_sn(self):
         mag = np.linspace(12.0, 20.0, 50)
         p0 = 1.0e-14
