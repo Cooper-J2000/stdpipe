@@ -103,9 +103,12 @@ def filter_sextractor_detections(
         log("Removing smooth trends in {} using approximate LOESS".format(", ".join(trend_cols)))
 
         if trend_scales and len(trend_scales) != len(trend_cols):
-            raise ValueError(f"trend_scales length is inconsistent with trend_cols length")
+            raise ValueError("trend_scales length is inconsistent with trend_cols length")
 
         pos = np.column_stack([np.array(obj[_]) for _ in trend_cols])
+        # Rows with non-finite trend columns cannot be detrended and would
+        # get NaN features anyway; keep them out of the fits below
+        idx &= np.all(np.isfinite(pos), axis=1)
         trend_models = []
         X = []
 

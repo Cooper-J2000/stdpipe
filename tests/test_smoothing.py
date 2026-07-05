@@ -106,6 +106,94 @@ def test_fit_vector_field_2d_grid_matches_reference():
     np.testing.assert_allclose(pred_dx, ref_dx, atol=0, rtol=0)
 
 
+def test_loess_nan_training_samples_dropped():
+    rng = np.random.default_rng(1)
+    X = rng.uniform(0, 10, (50, 2))
+    y = X[:, 0] + X[:, 1]
+    X[::7, 0] = np.nan
+    y[::5] = np.nan
+
+    reg = ApproxLoessRegressor(k=10, robust_iters=0)
+    reg.fit(X, y)
+
+    good = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
+    assert reg.n_samples_ == good.sum()
+    yhat = reg.predict(np.array([[5.0, 5.0]]))
+    assert np.isfinite(yhat[0])
+
+
+def test_loess_nan_query_returns_nan():
+    rng = np.random.default_rng(2)
+    X = rng.uniform(0, 10, (50, 2))
+    y = X[:, 0]
+
+    reg = ApproxLoessRegressor(k=10, robust_iters=1)
+    reg.fit(X, y)
+
+    Xq = np.array([[5.0, 5.0], [np.nan, 5.0], [5.0, np.nan]])
+    yhat = reg.predict(Xq)
+    assert np.isfinite(yhat[0])
+    assert np.isnan(yhat[1]) and np.isnan(yhat[2])
+
+
+def test_loess_robust_weights_computed_in_fit():
+    X = np.arange(10, dtype=float).reshape(-1, 1)
+    y = np.zeros(10)
+    y[5] = 100.0
+
+    reg = ApproxLoessRegressor(k=5, robust_iters=2)
+    reg.fit(X, y)
+
+    assert hasattr(reg, "robust_w_")
+    assert reg.robust_w_[5] < 0.5  # outlier downweighted
+    # Repeated predictions are deterministic and reuse the stored weights
+    a = reg.predict(X)
+    b = reg.predict(X)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_loess_refit_with_different_dimensionality():
+    reg = ApproxLoessRegressor(k=3, robust_iters=0)
+    reg.fit(np.zeros((5, 3)), np.zeros(5))
+    # scales=None must not be baked in as a 3-D array by the first fit
+    reg.fit(np.zeros((5, 2)), np.zeros(5))
+    assert reg.predict(np.zeros((1, 2))).shape == (1,)
+
+
+def test_loess_zero_weights_fall_back_to_kernel_mean():
+    X = np.arange(5, dtype=float).reshape(-1, 1)
+    y = np.full(5, 7.0)
+
+    reg = ApproxLoessRegressor(k=5, robust_iters=0)
+    reg.fit(X, y, sample_weight=np.zeros(5))
+    yhat = reg.predict(np.array([[2.0]]))
+    # Old behaviour silently returned 0 from the ridge-only system
+    np.testing.assert_allclose(yhat, 7.0)
+
+
+@pytest.mark.parametrize("backend", ["loess", "grid"])
+def test_fit_vector_field_2d_ignores_nan_samples_and_queries(backend):
+    x, y, dx, dy, dx_t, _, image_shape = _smooth_field_samples()
+    x = x.copy(); dx = dx.copy()
+    x[::9] = np.nan
+    dx[::11] = np.nan
+
+    kwargs = dict(image_shape=image_shape) if backend == "grid" else dict(k=120)
+    pred = fit_vector_field_2d(x, y, dx, dy, backend=backend, **kwargs)
+
+    dx_p, _ = pred(np.array([500.0, np.nan]), np.array([500.0, 500.0]))
+    assert np.isfinite(dx_p[0])
+    assert np.isnan(dx_p[1])
+
+
+def test_fit_vector_field_2d_grid_rejects_degenerate_input():
+    x = np.linspace(0, 100, 50)
+    with pytest.raises(ValueError, match="at least 2"):
+        fit_vector_field_2d(x, x, x, backend="grid", grid_shape=(1, 8))
+    with pytest.raises(ValueError, match="Degenerate"):
+        fit_vector_field_2d(np.full(50, 3.0), x, x, backend="grid")
+
+
 def test_fit_vector_field_2d_unknown_backend_raises():
     x = np.arange(10, dtype=float)
     with pytest.raises(ValueError, match="unknown backend"):

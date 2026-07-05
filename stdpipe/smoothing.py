@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
@@ -36,7 +38,11 @@ class ApproxLoessRegressor:
     Supports:
     - adaptive bandwidth (h = dist to k-th neighbor)
     - Gaussian kernel
-    - robust IRLS using Tukey bisquare
+    - robust IRLS using Tukey bisquare (weights computed once during fit
+      via leave-one-out self-prediction at the training points)
+
+    Samples with non-finite positions, values or weights are dropped during
+    fit; queries with non-finite positions predict NaN.
 
     Typical use: model smooth trend y = f(x, y, mag) and subtract.
     """
@@ -49,7 +55,7 @@ class ApproxLoessRegressor:
     min_bandwidth: float = 1e-6
     ridge: float = 1e-10  # tiny Tikhonov for numerical stability
     leaf_size: int = 40
-    n_jobs: int = None
+    n_jobs: int | None = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None):
         """
@@ -67,23 +73,34 @@ class ApproxLoessRegressor:
 
         D = X.shape[1]
         if self.scales is None:
-            self.scales = np.ones(D, dtype=float)
-        elif len(self.scales) != D:
-            raise ValueError(f"scales must have length D={D}")
+            scales = np.ones(D, dtype=float)
+        else:
+            scales = np.asarray(self.scales, float)
+            if len(scales) != D:
+                raise ValueError(f"scales must have length D={D}")
 
-        self.X_ = X
-        self.y_ = y
-        self.base_w_ = (
+        base_w = (
             np.ones_like(y)
             if sample_weight is None
             else np.asarray(sample_weight, float).reshape(-1)
         )
-        if self.base_w_.shape[0] != X.shape[0]:
+        if base_w.shape[0] != X.shape[0]:
             raise ValueError("sample_weight must have length N")
-        if np.any(self.base_w_ < 0):
+        if np.any(base_w < 0):
             raise ValueError("sample_weight must be non-negative")
 
-        self.scales_ = np.asarray(self.scales, float)
+        # Drop samples with non-finite positions, values or weights; the NN
+        # index cannot handle them, and they carry no usable information
+        good = np.all(np.isfinite(X), axis=1) & np.isfinite(y) & np.isfinite(base_w)
+        if not np.all(good):
+            X, y, base_w = X[good], y[good], base_w[good]
+        if X.shape[0] == 0:
+            raise ValueError("No finite samples to fit")
+
+        self.X_ = X
+        self.y_ = y
+        self.base_w_ = base_w
+        self.scales_ = scales
         self.Xs_ = self.X_ / self.scales_  # scaled for distance computations
         self.n_samples_ = self.X_.shape[0]
         self.k_ = min(self.k, self.n_samples_)
@@ -95,11 +112,33 @@ class ApproxLoessRegressor:
             n_jobs=self.n_jobs,
         )
         self.nn_.fit(self.Xs_)
+
+        # Robust IRLS weights from leave-one-out self-prediction at the
+        # training points, to downweight artifacts in the training set.
+        # They depend on the training data only, so they are computed once
+        # here rather than on every predict() call
+        robust_w = np.ones_like(self.y_)
+        for _ in range(self.robust_iters):
+            yfit = self._predict_core(self.X_, self.Xs_, robust_w, exclude_self=True)
+            resid = self.y_ - yfit
+            # Residual scale from points actually contributing to the fit
+            weighted = self.base_w_ > 0
+            s = _mad_sigma(resid[weighted] if np.any(weighted) else resid)
+            u = resid / (self.robust_c * s)
+            robust_w = _tukey_bisquare(u)
+            # Keep points whose self-prediction failed instead of treating
+            # them as outliers
+            robust_w[~np.isfinite(resid)] = 1.0
+        self.robust_w_ = robust_w
+
         return self
 
     def predict(self, Xq: np.ndarray, chunk: int = 4096) -> np.ndarray:
         """
         Predict yhat for query points Xq using local linear LOESS.
+
+        Queries with non-finite coordinates return NaN. Robust weights for
+        the training points were pre-computed during :meth:`fit`.
         """
         Xq = np.asarray(Xq, float)
         if Xq.ndim != 2:
@@ -107,29 +146,15 @@ class ApproxLoessRegressor:
         if Xq.shape[1] != self.X_.shape[1]:
             raise ValueError("Xq must have same D as training X")
 
-        M, D = Xq.shape
-        Xqs = Xq / self.scales_
+        yhat = np.full(Xq.shape[0], np.nan, dtype=float)
 
-        yhat = np.empty(M, float)
-
-        # Robust IRLS: we compute robust weights based on residuals at training points
-        # by LOESS self-prediction. This is optional but very useful to downweight artifacts
-        # in the training set.
-        robust_w_train = np.ones_like(self.y_, float)
-
-        for it in range(max(1, self.robust_iters + 1)):
-            # For stability: during IRLS, we predict at TRAIN points to update residual weights.
-            # Final iteration uses those weights to predict at query points.
-            if it < self.robust_iters:
-                yfit_train = self._predict_core(
-                    self.X_, self.Xs_, robust_w_train, chunk=chunk, exclude_self=True
-                )
-                resid = self.y_ - yfit_train
-                s = _mad_sigma(resid)
-                u = resid / (self.robust_c * s)
-                robust_w_train = _tukey_bisquare(u)
-            else:
-                yhat[:] = self._predict_core(Xq, Xqs, robust_w_train, chunk=chunk)
+        # Non-finite queries would crash the NN search; predict NaN for them
+        good = np.all(np.isfinite(Xq), axis=1)
+        if np.any(good):
+            Xg = Xq[good]
+            yhat[good] = self._predict_core(
+                Xg, Xg / self.scales_, self.robust_w_, chunk=chunk
+            )
 
         return yhat
 
@@ -158,17 +183,10 @@ class ApproxLoessRegressor:
                 Xqs[start:end], n_neighbors=k_query, return_distance=True
             )  # (m, k_query)
             if exclude_self and k_query > k_base:
-                m = end - start
-                dists_k = np.empty((m, k_base), float)
-                idxs_k = np.empty((m, k_base), int)
-                for i in range(m):
-                    if dists[i, 0] == 0.0:
-                        dists_k[i] = dists[i, 1 : k_base + 1]
-                        idxs_k[i] = idxs[i, 1 : k_base + 1]
-                    else:
-                        dists_k[i] = dists[i, 0:k_base]
-                        idxs_k[i] = idxs[i, 0:k_base]
-                dists, idxs = dists_k, idxs_k
+                # Drop one zero-distance (self) neighbour per row where present
+                has_self = (dists[:, 0] == 0.0)[:, None]
+                dists = np.where(has_self, dists[:, 1:], dists[:, :k_base])
+                idxs = np.where(has_self, idxs[:, 1:], idxs[:, :k_base])
             # adaptive bandwidth per query point: h = distance to furthest neighbor
             h = np.maximum(dists[:, -1], self.min_bandwidth)  # (m,)
             # kernel weights
@@ -180,12 +198,22 @@ class ApproxLoessRegressor:
             z = dists / h[:, None]
             w_kernel = np.exp(-0.5 * z * z)
             if exclude_self and k_query == k_base:
-                w_kernel = np.where(dists == 0.0, 0.0, w_kernel)
+                # k covers the whole training set; zero out one zero-distance
+                # (self) neighbour per row, consistent with the branch above
+                w_kernel[dists[:, 0] == 0.0, 0] = 0.0
 
             # Pull neighbor values
             Yn = self.y_[idxs]  # (m, k)
             # Combine weights: base * robust * kernel
             w = w_kernel * (self.base_w_[idxs] * robust_w_train[idxs])  # (m, k)
+
+            # Where base/robust weights rejected every neighbour, fall back
+            # to plain kernel weights instead of silently predicting 0 from
+            # the ridge-only system; if even those are all zero, predict NaN
+            rejected = ~(np.sum(w, axis=1) > 0)
+            if np.any(rejected):
+                w[rejected] = w_kernel[rejected]
+            unusable = ~(np.sum(w, axis=1) > 0)
 
             # Local linear regression around each query:
             # y ≈ b0 + b1*(x-xq) + b2*(y-yq) + b3*(mag-magq) ...
@@ -212,16 +240,15 @@ class ApproxLoessRegressor:
             ATA = np.einsum("mkp,mkq->mpq", Aw, Aw)  # (m, P, P)
             ATy = np.einsum("mkp,mk->mp", Aw, yw)  # (m, P)
 
-            # Ridge for numerical stability (especially in sparse regions)
+            # Ridge for numerical stability (especially in sparse regions);
+            # ATA + ridge*I is symmetric positive definite, so the batched
+            # solve cannot encounter an exactly singular system
             ATA[:, range(P), range(P)] += self.ridge
 
-            # Solve per-query small linear system
+            # Batched solve of the per-query small linear systems.
             # We need b0 only (intercept) because dX=0 at query point.
-            # Use np.linalg.solve in a loop over m (P is small: 4 when D=3).
-            b0 = np.empty(m, float)
-            for i in range(m):
-                beta = np.linalg.solve(ATA[i], ATy[i])
-                b0[i] = beta[0]
+            b0 = np.linalg.solve(ATA, ATy[:, :, None])[:, 0, 0]
+            b0[unusable] = np.nan
             out[start:end] = b0
 
         return out
@@ -269,6 +296,16 @@ def _smooth_grid(values, weights, sigma):
 
 
 def _fit_grid_one(x, y, vals, x_edges, y_edges, min_per_cell, smooth_sigma):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    vals = np.asarray(vals, float)
+
+    # Non-finite positions would be silently binned into the last cell by
+    # digitize+clip, and non-finite values would poison cell medians
+    good = np.isfinite(x) & np.isfinite(y) & np.isfinite(vals)
+    if not np.all(good):
+        x, y, vals = x[good], y[good], vals[good]
+
     nx = len(x_edges) - 1
     ny = len(y_edges) - 1
     x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
@@ -318,10 +355,20 @@ def _fit_grid_field_2d(
 ):
     x = np.asarray(x, float); y = np.asarray(y, float)
     dx = np.asarray(dx, float)
+    if grid_shape[0] < 2 or grid_shape[1] < 2:
+        # RegularGridInterpolator needs at least 2 points per dimension
+        raise ValueError("grid_shape dimensions must be at least 2")
     if image_shape is None:
-        H = float(np.max(y)) - float(np.min(y))
-        W = float(np.max(x)) - float(np.min(x))
-        x0, y0 = float(np.min(x)), float(np.min(y))
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not np.any(finite):
+            raise ValueError("No finite sample positions")
+        H = float(np.max(y[finite])) - float(np.min(y[finite]))
+        W = float(np.max(x[finite])) - float(np.min(x[finite]))
+        if W <= 0 or H <= 0:
+            raise ValueError(
+                "Degenerate x/y extent; provide image_shape explicitly"
+            )
+        x0, y0 = float(np.min(x[finite])), float(np.min(y[finite]))
         x_edges = np.linspace(x0, x0 + W, grid_shape[0] + 1)
         y_edges = np.linspace(y0, y0 + H, grid_shape[1] + 1)
     else:
@@ -419,6 +466,11 @@ def fit_vector_field_2d(
     predict : callable
         ``predict(xq, yq)`` returns a single ``ndarray`` for a scalar
         field, or a ``(dx_pred, dy_pred)`` tuple for a vector field.
+
+    Notes
+    -----
+    Samples with non-finite positions or values are ignored by both
+    backends, and queries at non-finite positions return NaN.
     """
     if backend == "loess":
         if scales is None:
