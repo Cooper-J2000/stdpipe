@@ -15,8 +15,8 @@ from astropy.stats import mad_std
 from astropy.table import Table
 from astropy.coordinates import SkyCoord
 
-# from scipy.ndimage import binary_dilation
-from astropy.convolution import Tophat2DKernel, convolve, convolve_fft
+from scipy.ndimage import binary_dilation
+from astropy.convolution import Tophat2DKernel
 
 from . import utils
 from . import photometry
@@ -96,6 +96,8 @@ def get_hips_image(
     # Simple wrapper around print for logging in verbose mode only
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
+    wcs_orig = None  # Original grid WCS, set if the request is upscaled
+
     if wcs is None and header is not None:
         wcs = WCS(header)
 
@@ -105,6 +107,12 @@ def get_hips_image(
         elif header is not None:
             width = header['NAXIS1']
             height = header['NAXIS2']
+        elif wcs is not None and wcs.pixel_shape is not None:
+            width, height = wcs.pixel_shape
+
+    if width is None or height is None:
+        log('Frame size is not provided')
+        return (None, None) if get_header else None
 
     params = {
         'hips': hips,
@@ -129,6 +137,7 @@ def get_hips_image(
 
         if upscale and upscale > 1:
             log('Upscaling the image %dx' % upscale)
+            wcs_orig = wcs
             wcs = astrometry.upscale_wcs(wcs, upscale, will_rebin=True)
             params['width'] *= upscale
             params['height'] *= upscale
@@ -146,15 +155,11 @@ def get_hips_image(
         params['fov'] = fov
     else:
         log('Sky position and size are not provided')
-        return None, None
-
-    if width is None or height is None:
-        log('Frame size is not provided')
-        return None, None
+        return (None, None) if get_header else None
 
     for baseurl in [
-        'http://alasky.u-strasbg.fr/hips-image-services/hips2fits',
-        'http://alaskybis.u-strasbg.fr/hips-image-services/hips2fits',
+        'https://alasky.u-strasbg.fr/hips-image-services/hips2fits',
+        'https://alaskybis.u-strasbg.fr/hips-image-services/hips2fits',
     ]:
         url = baseurl + '?' + urlencode(params)
 
@@ -164,9 +169,7 @@ def get_hips_image(
             t1 = time.time()
             log('Downloaded HiPS image in %.2f s' % (t1 - t0))
             break
-        except KeyboardInterrupt:
-            raise
-        except:
+        except Exception:
             log('Failed downloading HiPS image from', url)
             hdu = None
 
@@ -198,10 +201,14 @@ def get_hips_image(
         x = image * 0.4 * np.log(10)
         image = np.exp(x) - np.exp(-x)
 
-    if upscale and upscale > 1:
+    if wcs_orig is not None:
         # We should do downscaling after conversion of the image back to linear flux scaling
         log('Downscaling the image %dx' % upscale)
         image = utils.rebin_image(image, upscale)
+        # The header from hips2fits describes the upscaled grid - restore the original WCS
+        header.update(wcs_orig.to_header(relax=True))
+        header['NAXIS1'] = image.shape[1]
+        header['NAXIS2'] = image.shape[0]
 
     if normalize:
         # Normalize the image to have median=100 and std=10, corresponding to GAIN=1 assuming Poissonian background
@@ -220,18 +227,11 @@ def get_hips_image(
 
 def dilate_mask(mask, dilate=5):
     """
-    Dilate binary mask with a given kernel size
+    Dilate binary mask with a circular kernel of a given radius
     """
 
-    kernel = Tophat2DKernel(dilate).array
-    # mask = binary_dilation(mask, kernel)
-    if dilate < 10 or True:  # it seems convolve is faster than convolve_fft even for 2k x 2k
-        mask = convolve(mask, kernel)
-    else:
-        mask = convolve_fft(mask, kernel)
-    mask = mask > 1e-15 * np.max(mask)  # FIXME: is it correct threshold?..
-
-    return mask
+    kernel = Tophat2DKernel(dilate).array > 0
+    return binary_dilation(mask, kernel)
 
 
 def mask_template(
@@ -320,11 +320,15 @@ def mask_template(
     else:
         tmask = np.zeros_like(tmpl, dtype=bool)
 
+    if cat is not None and wcs is None:
+        log('Catalogue provided but no WCS, skipping catalogue-based masking')
+
     if cat is not None and wcs is not None:
         # Mask the central pixels of saturated stars
-        cx, cy = wcs.all_world2pix(cat[cat_col_ra], cat[cat_col_dec], 0)
-        cx = np.round(cx).astype(int)
-        cy = np.round(cy).astype(int)
+        cx, cy = wcs.all_world2pix(cat[cat_col_ra], cat[cat_col_dec], 0, quiet=True)
+        # Objects that failed to project will be rejected by the bounds check below
+        cx = np.where(np.isfinite(cx), np.round(cx), -1).astype(int)
+        cy = np.where(np.isfinite(cy), np.round(cy), -1).astype(int)
 
         tidx = np.zeros(len(cat), dtype=bool)
 
@@ -364,8 +368,11 @@ def mask_template(
                 scale_noise=True,
             )
 
-            idx = ~tm['idx'] & (tm['zero'] - tm['zero_model'] < -0.1)
-            tidx[tm['cidx'][idx]] = True
+            if tm is not None:
+                idx = ~tm['idx'] & (tm['zero'] - tm['zero_model'] < -0.1)
+                tidx[tm['cidx'][idx]] = True
+            else:
+                log('Photometric calibration failed, skipping photometric masking')
 
         # ..and keep only the ones inside the image
         tidx &= (cx >= 0) & (cx <= tmpl.shape[1] - 1)
@@ -383,7 +390,7 @@ def mask_template(
             log(np.sum(tmask), 'template pixels masked after catalogue checking')
 
     if dilate and dilate > 0:
-        log('Dilating the mask with %d x %d kernel' % (dilate, dilate))
+        log('Dilating the mask with circular kernel of radius %d' % dilate)
         tmask = dilate_mask(tmask, dilate)
         log(np.sum(tmask), 'template pixels masked after dilation')
 
@@ -429,7 +436,7 @@ def _filter_cells_by_footprint(cell_ra, cell_dec, cell_radius, wcs, width, heigh
     margin = cell_radius / pixscale  # cell radius in pixels
 
     # Project cell centres to pixel coordinates (may be outside image)
-    px, py = wcs.all_world2pix(cell_ra, cell_dec, 0)
+    px, py = wcs.all_world2pix(cell_ra, cell_dec, 0, quiet=True)
 
     keep = (px > -margin) & (px < width + margin) & (py > -margin) & (py < height + margin)
     return keep
@@ -489,7 +496,7 @@ def find_skycells(
             candidates = candidates[keep]
 
         for cell in candidates:
-            url = 'http://ps1images.stsci.edu/'
+            url = 'https://ps1images.stsci.edu/'
             url += 'rings.v3.skycell/%04d/%03d/' % (
                 cell['projectionID'],
                 cell['skyCellID'],
@@ -566,7 +573,7 @@ def fits_open_remote(url, **kwargs):
 
         try:
             hdu = fits.open(url, **kwargs)
-        except:
+        except Exception:
             import traceback
 
             traceback.print_exc()
@@ -616,10 +623,7 @@ def get_skycells(
         log('Cache location not specified, falling back to %s' % _cachedir)
 
     # Ensure the cache dir exists
-    try:
-        os.makedirs(_cachedir)
-    except:
-        pass
+    os.makedirs(_cachedir, exist_ok=True)
 
     filenames = []
 
@@ -659,7 +663,7 @@ def get_skycells(
                                 invvar = ihdu[1].data
                                 image[invvar == 0] = np.nan
                                 ihdu.close()
-                        except:
+                        except Exception:
                             pass
 
                 if _cache_downscale > 1:
@@ -675,7 +679,10 @@ def get_skycells(
                         os.path.split(filename)[-1],
                     )
 
-                fits.writeto(filename, image, header, overwrite=True)
+                # Write atomically so that an interrupted write does not leave
+                # a truncated file in the cache
+                fits.writeto(filename + '.tmp', image, header, overwrite=True)
+                os.replace(filename + '.tmp', filename)
 
                 hdu.close()
 
@@ -693,11 +700,11 @@ def normalize_ps1_skycell(image, header, verbose=False):
     # Simple wrapper around print for logging in verbose mode only
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
+    header = header.copy()
+
     if 'RADESYS' not in header and 'PC001001' in header:
         # Normalize WCS in the header
         log('Normalizing WCS keywords')
-
-        header = header.copy()
 
         header['RADESYS'] = 'FK5'
         header.rename_keyword('PC001001', 'PC1_1')
@@ -705,16 +712,17 @@ def normalize_ps1_skycell(image, header, verbose=False):
         header.rename_keyword('PC002001', 'PC2_1')
         header.rename_keyword('PC002002', 'PC2_2')
 
-        if 'BSOFTEN' in header and 'BOFFSET' in header:
-            # Linearize ASINH scaling
-            log('Normalizing ASINH scaling')
+    if 'BSOFTEN' in header and 'BOFFSET' in header:
+        # Linearize ASINH scaling
+        log('Normalizing ASINH scaling')
 
-            x = image * 0.4 * np.log(10)
-            image = header['BOFFSET'] + header['BSOFTEN'] * (np.exp(x) - np.exp(-x))
+        x = image * 0.4 * np.log(10)
+        image = header['BOFFSET'] + header['BSOFTEN'] * (np.exp(x) - np.exp(-x))
+        if header.get('EXPTIME'):
             image /= header['EXPTIME']  # For common photometric zero-point
 
-            for _ in ['BSOFTEN', 'BOFFSET', 'BLANK']:
-                header.remove(_, ignore_missing=True)
+        for _ in ['BSOFTEN', 'BOFFSET', 'BLANK']:
+            header.remove(_, ignore_missing=True)
 
     return image, header
 
@@ -792,9 +800,13 @@ def get_survey_image(
 
     # Resolve WCS and dimensions early so we can use them for cell filtering
     if wcs is None:
+        if header is None:
+            raise ValueError('Either wcs or header should be provided')
         wcs = WCS(header)
     if shape is not None:
         height, width = shape
+    if (width is None or height is None) and header is None:
+        raise ValueError('Either shape, width/height or header should be provided')
     if width is None:
         width = header['NAXIS1']
     if height is None:
@@ -843,6 +855,10 @@ def get_survey_image(
         )
     else:
         log("Unknown reproject method '%s', use 'lanczos' or 'swarp'" % reproject)
+        return None
+
+    if coadd is None:
+        log('No skycells were reprojected onto the requested grid')
         return None
 
     if ext == 'mask' and survey == 'ps1':

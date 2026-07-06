@@ -318,9 +318,7 @@ class TestGetHipsImage:
         result = templates.get_hips_image(
             'CDS/P/DSS2/red', width=100, height=100, get_header=False
         )
-        # The function returns None, None even with get_header=False on this path
-        # (it returns before checking get_header)
-        assert result == (None, None)
+        assert result is None
 
     @pytest.mark.unit
     @patch('stdpipe.templates.fits.open')
