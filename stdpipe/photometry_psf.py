@@ -183,29 +183,6 @@ def _compute_psf_quality_columns(
     return quality
 
 
-def _build_circular_fit_mask(shape, x_positions, y_positions, radius):
-    mask_fit = np.ones(shape, dtype=bool)
-    r2 = radius**2
-    for x, y in zip(x_positions, y_positions):
-        if not np.isfinite(x) or not np.isfinite(y):
-            continue
-        x0 = int(np.floor(x - radius))
-        x1 = int(np.ceil(x + radius)) + 1
-        y0 = int(np.floor(y - radius))
-        y1 = int(np.ceil(y + radius)) + 1
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        x1 = min(shape[1], x1)
-        y1 = min(shape[0], y1)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        inside = (xx - x) ** 2 + (yy - y) ** 2 <= r2
-        sub = mask_fit[y0:y1, x0:x1]
-        sub[inside] = False
-    return mask_fit
-
-
 class GradientLocalBackground(photutils.background.LocalBackground):
     """
     Local background estimator using gradient fitting with sigma-clipping.
@@ -332,7 +309,11 @@ class GradientLocalBackground(photutils.background.LocalBackground):
                     # Too many rejections, stop
                     break
 
-                # Fit current good points
+                # Fit current good points. ``coeffs`` stays None when the
+                # polynomial fit was not performed or failed, so the outlier
+                # rejection below falls back to the constant ``bg_fit``.
+                coeffs = None
+
                 if self.order == 0:
                     # Constant (mean)
                     bg_fit = np.mean(z_good)
@@ -380,9 +361,9 @@ class GradientLocalBackground(photutils.background.LocalBackground):
                     # Perfect fit or constant values, stop
                     break
 
-                # Find outliers in the FULL dataset (not just current good points)
-                # Compute residuals for all points using current fit
-                if self.order == 0:
+                # Compute residuals for the current good points using the fit
+                # (falls back to the constant when the polynomial fit failed)
+                if self.order == 0 or coeffs is None:
                     all_residuals = z_annulus[good_mask] - bg_fit
                 elif self.order == 1:
                     dx_all = x_annulus[good_mask] - xi
@@ -552,8 +533,9 @@ def measure_objects_psf(
         Minimal S/N ratio for the object to be considered good. If set, all
         measurements with magnitude errors exceeding 1/sn will be discarded.
     fit_shape : str, optional
-        Shape of fitting region. Options: 'circular' (default), 'square'.
-        Determines the aperture used for PSF fitting.
+        Accepted for API compatibility ('circular' or 'square'). photutils
+        PSFPhotometry always fits a square region of ``fit_size`` pixels, so
+        both values currently behave identically.
     fit_size : int or None, optional
         Size of fitting region in pixels. If None, defaults to psf_size.
     maxiters : int, optional
@@ -573,7 +555,7 @@ def measure_objects_psf(
         sources simultaneously for better accuracy in crowded fields.
     grouper_radius : float or None, optional
         Radius in pixels for grouping nearby sources. If None, defaults to
-        2*psf_size. Only used if group_sources is True.
+        ``max(2.5*fwhm, fit_size/2)``. Only used if group_sources is True.
     compute_quality : bool, optional
         If True (default), compute crowdsource-style per-source quality
         metrics: ``qf`` (PSF quality factor), ``fracflux`` (fraction of
@@ -714,9 +696,19 @@ def measure_objects_psf(
             if psf_size is None:
                 psf_size = _compute_native_psf_size(psf['height'], psf_sampling)
         else:
-            log('Using PSFEx/ePSF PSF model (constant across field)')
-            # Get PSF stamp at center position (0,0 works for degree=0)
-            psf_image = psf_module.get_supersampled_psf_stamp(psf, x=0, y=0, normalize=True)
+            if psf_degree > 0:
+                log(
+                    'Using spatially varying PSFEx model as constant PSF '
+                    '(evaluated at the polynomial zero-point; '
+                    'set use_position_dependent_psf=True for per-source evaluation)'
+                )
+            else:
+                log('Using PSFEx/ePSF PSF model (constant across field)')
+            # Evaluate at the polynomial zero-point (~field centre); (0, 0)
+            # would extrapolate a varying model to the image corner
+            psf_image = psf_module.get_supersampled_psf_stamp(
+                psf, x=psf.get('x0', 0), y=psf.get('y0', 0), normalize=True
+            )
 
             # Handle oversampling if needed
             oversampling = _compute_oversampling(psf_sampling)
@@ -766,22 +758,20 @@ def measure_objects_psf(
 
     # Add initial flux guesses if available
     if 'flux' in obj.colnames:
-        init_params['flux'] = np.ma.filled(np.asarray(obj['flux']), fill_value=np.nan)
+        flux0 = np.ma.filled(np.asarray(obj['flux'], dtype=float), fill_value=np.nan)
+        # A non-finite initial flux poisons the fit of the source (and, in
+        # grouped mode, of its whole group) — fall back to a finite guess
+        bad0 = ~np.isfinite(flux0)
+        if np.any(bad0):
+            finite0 = flux0[~bad0]
+            flux0[bad0] = np.median(finite0) if len(finite0) else 1000.0
+        init_params['flux'] = flux0
     else:
         # Estimate initial flux from image at positions
         init_params['flux'] = 1000.0  # Default initial guess
 
     if fit_shape not in ['circular', 'square']:
         raise ValueError("fit_shape must be 'circular' or 'square'")
-
-    fit_mask = None
-    if fit_shape == 'circular' and np.any(valid_pos):
-        fit_mask = _build_circular_fit_mask(
-            image1.shape,
-            init_params['x'][valid_pos],
-            init_params['y'][valid_pos],
-            radius=fit_size / 2,
-        )
 
     # Import fitting class
     from astropy.modeling.fitting import LevMarLSQFitter
@@ -790,7 +780,10 @@ def measure_objects_psf(
     grouper = None
     if group_sources:
         if grouper_radius is None:
-            grouper_radius = 2 * psf_size
+            # Sources interact when their fitting boxes overlap appreciably;
+            # ~2.5 FWHM (or half the fit box) covers that while avoiding the
+            # huge chained groups a stamp-sized radius produces in dense fields
+            grouper_radius = max(2.5 * fwhm_scalar, 0.5 * fit_size)
         log('Using grouped PSF fitting with grouper radius %.1f pixels' % grouper_radius)
         grouper = photutils.psf.SourceGrouper(min_separation=grouper_radius)
 
@@ -812,7 +805,7 @@ def measure_objects_psf(
 
     # Handle position-dependent PSF separately
     if psf_is_position_dependent:
-        log('Performing position-dependent PSF photometry (iterative mode)')
+        log('Performing position-dependent PSF photometry (per-group PSF evaluation)')
         # Initialize output columns
         obj['flux'] = np.nan
         obj['fluxerr'] = np.nan
@@ -835,43 +828,52 @@ def measure_objects_psf(
         if 'flags' not in obj.keys():
             obj['flags'] = 0
 
+        # Mark invalid positions (masked/NaN) as failed
+        obj['flags'][~valid_pos] |= 0x1000
+
         # Get sampling (psf_model is always dict at this point)
         psf_sampling = psf_model['sampling']
         oversampling = _compute_oversampling(psf_sampling)
 
-        # Process objects individually or in small groups
-        # For each object, evaluate PSF at its position
-        for i in range(len(obj)):
-            # Skip invalid positions (masked/NaN)
-            if not valid_pos[i]:
-                obj['flux'][i] = np.nan
-                obj['fluxerr'][i] = np.nan
-                obj['flags'][i] |= 0x1000
-                continue
+        # Set up local background estimator if requested (shared by all groups)
+        localbkg_estimator = None
+        if bkgann is not None and len(bkgann) == 2:
+            localbkg_estimator = GradientLocalBackground(bkgann[0], bkgann[1], order=bkg_order)
+
+        # Group nearby sources and fit each group jointly with a PSF
+        # evaluated once at the group position; fitting sources one at a
+        # time would leave neighbour flux unmodelled exactly in the crowded
+        # wide-field cases where a varying PSF matters most
+        valid_idx = np.where(valid_pos)[0]
+        xv = np.asarray(init_params['x'], dtype=float)[valid_idx]
+        yv = np.asarray(init_params['y'], dtype=float)[valid_idx]
+        fv = np.asarray(init_params['flux'], dtype=float)[valid_idx]
+
+        if grouper is not None and len(valid_idx) > 1:
+            group_ids = np.asarray(grouper(xv, yv))
+        else:
+            group_ids = np.arange(len(valid_idx))
+
+        for gid in np.unique(group_ids):
+            in_group = group_ids == gid
+            sel = valid_idx[in_group]
 
             try:
-                # Get object position
-                x_pos = float(init_params['x'][i])
-                y_pos = float(init_params['y'][i])
-
-                # Evaluate PSF at this position using dict-based PSF
+                # Evaluate PSF at the group mean position (the PSF varies
+                # smoothly on the scale of a group)
                 psf_image = psf_module.get_supersampled_psf_stamp(
-                    psf_model, x=x_pos, y=y_pos, normalize=True
+                    psf_model,
+                    x=float(np.mean(xv[in_group])),
+                    y=float(np.mean(yv[in_group])),
+                    normalize=True,
                 )
                 psf_image = _scale_psf_image_for_photutils(psf_image, oversampling)
 
-                # Create photutils PSF model for this position
+                # Create photutils PSF model for this group position
                 psf_at_pos = photutils.psf.ImagePSF(psf_image, oversampling=oversampling)
 
-                # Set up local background estimator if requested
-                localbkg_estimator = None
-                if bkgann is not None and len(bkgann) == 2:
-                    localbkg_estimator = GradientLocalBackground(
-                        bkgann[0], bkgann[1], order=bkg_order
-                    )
-
-                # Set up photometry for this object
-                phot_single = photutils.psf.PSFPhotometry(
+                # Set up photometry for this group
+                phot_group = photutils.psf.PSFPhotometry(
                     psf_model=psf_at_pos,
                     fit_shape=fit_size,
                     finder=None,
@@ -883,80 +885,79 @@ def measure_objects_psf(
                     localbkg_estimator=localbkg_estimator,
                 )
 
-                # Measure this object
-                init_single = Table()
-                init_single['x'] = [obj['x'][i]]
-                init_single['y'] = [obj['y'][i]]
-                if 'flux' in init_params.colnames:
-                    init_single['flux'] = [init_params['flux'][i]]
-                else:
-                    init_single['flux'] = [1000.0]
+                # Measure this group
+                init_group = Table()
+                init_group['x'] = xv[in_group]
+                init_group['y'] = yv[in_group]
+                init_group['flux'] = fv[in_group]
 
-                result_single = phot_single(
-                    image1, mask=mask_for_fit, error=err, init_params=init_single
+                result_group = phot_group(
+                    image1, mask=mask_for_fit, error=err, init_params=init_group
                 )
 
-                # Extract results
-                obj['flux'][i] = result_single['flux_fit'][0]
-                obj['fluxerr'][i] = result_single['flux_err'][0]
-                obj['x_psf'][i] = result_single['x_fit'][0]
-                obj['y_psf'][i] = result_single['y_fit'][0]
+                # Extract results (result rows follow init_params order)
+                for row, i in enumerate(sel):
+                    obj['flux'][i] = result_group['flux_fit'][row]
+                    obj['fluxerr'][i] = result_group['flux_err'][row]
+                    obj['x_psf'][i] = result_group['x_fit'][row]
+                    obj['y_psf'][i] = result_group['y_fit'][row]
 
-                # Extract quality of fit columns if available
-                if 'qfit' in result_single.colnames:
-                    obj['qfit_psf'][i] = result_single['qfit'][0]
-                if 'cfit' in result_single.colnames:
-                    obj['cfit_psf'][i] = result_single['cfit'][0]
-                if 'flags' in result_single.colnames:
-                    obj['flags_psf'][i] = result_single['flags'][0]
-                if 'npixfit' in result_single.colnames:
-                    obj['npix_psf'][i] = result_single['npixfit'][0]
-                if 'reduced_chi2' in result_single.colnames:
-                    obj['reduced_chi2_psf'][i] = result_single['reduced_chi2'][0]
+                    # Extract quality of fit columns if available
+                    if 'qfit' in result_group.colnames:
+                        obj['qfit_psf'][i] = result_group['qfit'][row]
+                    if 'cfit' in result_group.colnames:
+                        obj['cfit_psf'][i] = result_group['cfit'][row]
+                    if 'flags' in result_group.colnames:
+                        obj['flags_psf'][i] = result_group['flags'][row]
+                    if 'npixfit' in result_group.colnames:
+                        obj['npix_psf'][i] = result_group['npixfit'][row]
+                    if 'reduced_chi2' in result_group.colnames:
+                        obj['reduced_chi2_psf'][i] = result_group['reduced_chi2'][row]
 
-                # Flag if fit failed
-                if not np.isfinite(obj['flux'][i]):
-                    obj['flags'][i] |= 0x1000
-                # Also flag if fit didn't converge or returned input unchanged
-                elif 'flags' in result_single.colnames:
-                    # Check bit 0 (convergence failure)
-                    bit0_set = (result_single['flags'][0] & 1) != 0
-
-                    # Check for exact match with input when photutils claims it converged
-                    # (bit 0 NOT set). This catches cases where photutils returns input
-                    # unchanged but doesn't set bit 0.
-                    converged_but_unchanged = (
-                        (result_single['flags'][0] & 1) == 0
-                        and obj['flux'][i] == init_single['flux'][0]
-                        and obj['x_psf'][i] == init_single['x'][0]
-                        and obj['y_psf'][i] == init_single['y'][0]
-                    )
-
-                    if bit0_set or converged_but_unchanged:
-                        log(
-                            'Warning: PSF fit did not converge or returned unchanged parameters for object %d, setting flux to NaN'
-                            % i
-                        )
-                        obj['flux'][i] = np.nan
-                        obj['fluxerr'][i] = np.nan
+                    # Flag if fit failed
+                    if not np.isfinite(obj['flux'][i]):
                         obj['flags'][i] |= 0x1000
+                    # Also flag if fit didn't converge or returned input unchanged
+                    elif 'flags' in result_group.colnames:
+                        # Check bit 0 (convergence failure)
+                        bit0_set = (result_group['flags'][row] & 1) != 0
 
-                # Flag if position moved significantly
-                if recentroid:
-                    if (
-                        np.sqrt(
-                            (obj['x_psf'][i] - obj['x'][i]) ** 2
-                            + (obj['y_psf'][i] - obj['y'][i]) ** 2
+                        # Check for exact match with input when photutils claims it converged
+                        # (bit 0 NOT set). This catches cases where photutils returns input
+                        # unchanged but doesn't set bit 0.
+                        converged_but_unchanged = (
+                            (result_group['flags'][row] & 1) == 0
+                            and obj['flux'][i] == init_group['flux'][row]
+                            and obj['x_psf'][i] == init_group['x'][row]
+                            and obj['y_psf'][i] == init_group['y'][row]
                         )
-                        > 1.0
-                    ):
-                        obj['flags'][i] |= 0x2000
+
+                        if bit0_set or converged_but_unchanged:
+                            log(
+                                'Warning: PSF fit did not converge or returned unchanged parameters for object %d, setting flux to NaN'
+                                % i
+                            )
+                            obj['flux'][i] = np.nan
+                            obj['fluxerr'][i] = np.nan
+                            obj['flags'][i] |= 0x1000
+
+                    # Flag if position moved significantly
+                    if recentroid:
+                        if (
+                            np.sqrt(
+                                (obj['x_psf'][i] - obj['x'][i]) ** 2
+                                + (obj['y_psf'][i] - obj['y'][i]) ** 2
+                            )
+                            > 1.0
+                        ):
+                            obj['flags'][i] |= 0x2000
 
             except Exception as e:
-                log('PSF photometry failed for object %d: %s' % (i, str(e)))
-                obj['flux'][i] = np.nan
-                obj['fluxerr'][i] = np.nan
-                obj['flags'][i] |= 0x1000
+                log('PSF photometry failed for group of %d objects: %s' % (len(sel), str(e)))
+                for i in sel:
+                    obj['flux'][i] = np.nan
+                    obj['fluxerr'][i] = np.nan
+                    obj['flags'][i] |= 0x1000
 
     else:
         # Standard (non-position-dependent) PSF photometry
@@ -1117,6 +1118,7 @@ def measure_objects_psf(
     log('PSF photometry complete: %d objects measured' % len(obj))
 
     if get_bg:
-        return obj, bg_est_bg, err
+        # Return the background that was actually subtracted
+        return obj, (bg if bg is not None else bg_est_bg), err
     else:
         return obj

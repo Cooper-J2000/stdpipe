@@ -490,7 +490,15 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     # Oversampling factor
     N = int(round(1.0 / psf['sampling']))
 
-    if N > 1 and supersampled.shape[0] % N == 0 and supersampled.shape[1] % N == 0:
+    if (
+        N > 1
+        # Block-summing N x N subpixels assumes each subpixel is exactly 1/N
+        # image pixels; a non-integer 1/sampling (e.g. PSFEx PSF_SAMP=0.53)
+        # would silently rescale the PSF by sampling*N
+        and np.isclose(N * psf['sampling'], 1.0, rtol=1e-3, atol=0)
+        and supersampled.shape[0] % N == 0
+        and supersampled.shape[1] % N == 0
+    ):
         # Flux-conserving downsampling: shift at oversampled resolution, then sum N×N blocks.
         # The oversampled data stores pixel-integrated flux per subpixel, so the correct
         # way to get image-pixel flux is to sum the subpixels within each image pixel.
@@ -606,6 +614,7 @@ def create_psf_model(
     degree=0,
     regularization=1e-6,
     subtract_neighbors=True,
+    neighbors_obj=None,
     subtract_background=False,
     isolation=2.0,
     get_raw=False,
@@ -659,6 +668,13 @@ def create_psf_model(
     subtract_neighbors : bool, optional
         If True (default), subtract estimated flux from neighboring stars before extracting
         cutouts. Reduces contamination in crowded fields. Only used when ``degree > 0``.
+    neighbors_obj : astropy.table.Table, optional
+        Full detection catalogue (with 'x', 'y', 'flux' columns) used to model
+        neighbour contamination when ``subtract_neighbors=True``. If None, the
+        full auto-detected list is used when ``obj`` is None, otherwise ``obj``
+        itself. Passing the complete catalogue matters when ``obj`` is a
+        pre-selected subset (e.g. from :func:`select_psf_seeds`) — the stars
+        that actually contaminate the stamps are usually not in that subset.
     subtract_background : bool or {'none', 'median', 'plane'}, optional
         Local background handling for each training stamp before normalization. ``False`` or
         ``'none'`` leaves the current image values unchanged, ``True`` or ``'median'``
@@ -696,6 +712,11 @@ def create_psf_model(
         if len(obj) == 0:
             raise ValueError("No stars detected for ePSF building")
 
+        # Keep the full detection list for neighbour modelling before the
+        # quality/isolation selection below removes the real neighbours
+        if neighbors_obj is None:
+            neighbors_obj = obj
+
         # Determine FWHM and stamp size early so we can use them for edge filtering
         if fwhm is None:
             if 'fwhm' in obj.colnames:
@@ -711,10 +732,13 @@ def create_psf_model(
             size += 1
 
         flux_median = np.median(obj['flux'])
-        flux_std = np.std(obj['flux'])
+        # np.std is inflated by the bright tail, so a median + N*std upper
+        # bound lets saturated stars through; cut the brightest few percent
+        # instead, which is where saturated stars live
+        flux_upper = np.percentile(obj['flux'], 98)
 
         # Select stars with flux within reasonable range
-        idx = (obj['flux'] > flux_median) & (obj['flux'] < flux_median + 3 * flux_std)
+        idx = (obj['flux'] > flux_median) & (obj['flux'] < flux_upper)
         # Remove edge objects
         edge = size
         idx &= (obj['x'] > edge) & (obj['x'] < image.shape[1] - edge)
@@ -799,6 +823,7 @@ def create_psf_model(
             degree,
             regularization,
             subtract_neighbors,
+            neighbors_obj if neighbors_obj is not None else obj,
             background_mode,
             log,
         )
@@ -905,7 +930,13 @@ def _build_polynomial_psf_taper(reference_stamp, sampling, fwhm):
 def _regularize_polynomial_psf(coeffs, stamps_array, keep, sampling, fwhm):
     """Suppress spurious outer support and restore polynomial PSF normalization."""
 
-    reference_stamp = np.nanmedian(stamps_array[keep], axis=0)
+    import warnings
+
+    with warnings.catch_warnings():
+        # All-NaN pixels (masked in every kept stamp) are expected here
+        warnings.simplefilter('ignore', RuntimeWarning)
+        reference_stamp = np.nanmedian(stamps_array[keep], axis=0)
+    reference_stamp = np.where(np.isfinite(reference_stamp), reference_stamp, 0.0)
     window, taper_start, taper_width = _build_polynomial_psf_taper(reference_stamp, sampling, fwhm)
     coeffs *= window[np.newaxis, :, :]
 
@@ -1028,6 +1059,7 @@ def _create_psf_model_polynomial(
     degree,
     regularization,
     subtract_neighbors,
+    neighbors,
     background_mode,
     log,
 ):
@@ -1068,18 +1100,22 @@ def _create_psf_model_polynomial(
     ox_rel = (ox - os_center) * sampling  # relative to stamp center, in image pixels
     oy_rel = (oy - os_center) * sampling
 
-    # Build neighbor subtraction image if requested
-    # We subtract Gaussian approximations of all OTHER stars from each cutout
-    if subtract_neighbors and 'flux' in obj.colnames:
+    # Build neighbor subtraction data if requested
+    # We subtract Gaussian approximations of all OTHER detections (from the
+    # full catalogue, not just the training stars) from each cutout
+    if subtract_neighbors and neighbors is not None and 'flux' in neighbors.colnames:
         sigma = fwhm / 2.3548  # FWHM to sigma
-        star_x = np.array(obj['x'], dtype=np.float64)
-        star_y = np.array(obj['y'], dtype=np.float64)
-        star_flux = np.array(obj['flux'], dtype=np.float64)
+        nb_x = np.array(neighbors['x'], dtype=np.float64)
+        nb_y = np.array(neighbors['y'], dtype=np.float64)
+        nb_flux = np.array(neighbors['flux'], dtype=np.float64)
+        nb_ok = np.isfinite(nb_x) & np.isfinite(nb_y) & np.isfinite(nb_flux) & (nb_flux > 0)
+        nb_x, nb_y, nb_flux = nb_x[nb_ok], nb_y[nb_ok], nb_flux[nb_ok]
     else:
         subtract_neighbors = False
 
     # Extract and resample stamps
     stamps = []
+    stamp_valids = []
     positions_x = []
     positions_y = []
     stamp_fluxes = []
@@ -1109,17 +1145,19 @@ def _create_psf_model_polynomial(
         if subtract_neighbors:
             # Pixel coordinate grids for this cutout
             cy, cx = np.mgrid[y1:y2, x1:x2]
-            for j in range(len(obj)):
-                if j == i:
+            for j in range(len(nb_x)):
+                # Skip the target star itself (matched by position, as the
+                # neighbour catalogue may differ from the training list)
+                if abs(nb_x[j] - x_star) < 0.5 and abs(nb_y[j] - y_star) < 0.5:
                     continue
-                # Only consider neighbors close enough to affect this cutout
-                ndx = star_x[j] - ix
-                ndy = star_y[j] - iy
-                if abs(ndx) > half + 5 * sigma and abs(ndy) > half + 5 * sigma:
+                # Skip neighbors too far to affect this cutout
+                ndx = nb_x[j] - ix
+                ndy = nb_y[j] - iy
+                if abs(ndx) > half + 5 * sigma or abs(ndy) > half + 5 * sigma:
                     continue
                 # Subtract Gaussian approximation
-                r2 = (cx - star_x[j]) ** 2 + (cy - star_y[j]) ** 2
-                amp = star_flux[j] / (2 * np.pi * sigma**2)
+                r2 = (cx - nb_x[j]) ** 2 + (cy - nb_y[j]) ** 2
+                amp = nb_flux[j] / (2 * np.pi * sigma**2)
                 cutout -= amp * np.exp(-r2 / (2 * sigma**2))
 
         # Skip if mask has too many bad pixels in this cutout
@@ -1142,6 +1180,23 @@ def _create_psf_model_polynomial(
             cutout, [cutout_y, cutout_x], order=3, mode='constant', cval=0.0
         )
 
+        # Track oversampled pixels touched by masked image pixels, so the
+        # per-pixel polynomial fit can exclude them instead of being dragged
+        # towards the zero-filled values
+        if mask_cutout is not None and np.any(mask_cutout):
+            valid = (
+                ndimage.map_coordinates(
+                    (~mask_cutout).astype(np.float64),
+                    [cutout_y, cutout_x],
+                    order=1,
+                    mode='constant',
+                    cval=1.0,
+                )
+                > 0.99
+            )
+        else:
+            valid = np.ones((os_size, os_size), dtype=bool)
+
         # Normalize to unit flux
         total = np.sum(stamp)
         if not np.isfinite(total) or total <= 0:
@@ -1149,6 +1204,7 @@ def _create_psf_model_polynomial(
         stamp /= total
 
         stamps.append(stamp)
+        stamp_valids.append(valid)
         positions_x.append(x_star)
         positions_y.append(y_star)
         stamp_fluxes.append(float(obj['flux'][i]) if 'flux' in obj.colnames else 1.0)
@@ -1176,6 +1232,14 @@ def _create_psf_model_polynomial(
     # Stack stamps as [nstars, npixels]
     stamps_array = np.array(stamps)  # [nstars, os_size, os_size]
     pixels = stamps_array.reshape(nstars, -1)  # [nstars, npixels]
+    valid_array = np.array(stamp_valids)  # [nstars, os_size, os_size]
+    valid_pix = valid_array.reshape(nstars, -1)  # [nstars, npixels]
+    all_valid = bool(np.all(valid_pix))
+    if not all_valid:
+        log(
+            'Masked pixels present in %d / %d stamps, using per-pixel fit weights'
+            % (int(np.sum(~valid_pix.all(axis=1))), nstars)
+        )
 
     # Each training stamp is normalized to unit flux, so an unweighted solve
     # over-emphasizes low-S/N outer pixels from fainter stars and broadens the
@@ -1201,28 +1265,49 @@ def _create_psf_model_polynomial(
 
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
         for clip_iter in range(max_clip_iters + 1):
-            w_k = weights[keep]
-            V_k = V[keep] * w_k[:, np.newaxis]
-            pixels_k = pixels[keep] * w_k[:, np.newaxis]
             n_keep = int(keep.sum())
 
             if n_keep < ncoeffs:
                 break
 
-            if regularization > 0:
-                VTV = V_k.T @ V_k + regularization * np.eye(ncoeffs)
-                VTp = V_k.T @ pixels_k
-                coeffs = np.linalg.solve(VTV, VTp)
+            if all_valid:
+                w_k = weights[keep]
+                V_k = V[keep] * w_k[:, np.newaxis]
+                pixels_k = pixels[keep] * w_k[:, np.newaxis]
+
+                if regularization > 0:
+                    VTV = V_k.T @ V_k + regularization * np.eye(ncoeffs)
+                    VTp = V_k.T @ pixels_k
+                    coeffs = np.linalg.solve(VTV, VTp)
+                else:
+                    coeffs, _, _, _ = np.linalg.lstsq(V_k, pixels_k, rcond=None)
             else:
-                coeffs, _, _, _ = np.linalg.lstsq(V_k, pixels_k, rcond=None)
+                # Per-pixel normal equations excluding masked stamp pixels:
+                # each output pixel gets its own (ncoeffs x ncoeffs) system
+                # built only from the stamps valid at that pixel
+                Wm = (weights[keep] ** 2)[:, np.newaxis] * valid_pix[keep]  # (n, npix)
+                VTV = np.einsum('sp,sk,sl->pkl', Wm, V[keep], V[keep], optimize=True)
+                VTp = np.einsum('sp,sk->pk', Wm * pixels[keep], V[keep], optimize=True)
+                VTV += max(regularization, 0.0) * np.eye(ncoeffs)[np.newaxis]
+                try:
+                    coeffs = np.linalg.solve(VTV, VTp[..., np.newaxis])[..., 0].T
+                except np.linalg.LinAlgError:
+                    # Pixels with too few valid stamps yield singular systems
+                    coeffs = np.einsum(
+                        'pkl,pl->pk', np.linalg.pinv(VTV), VTp, optimize=True
+                    ).T
 
             if clip_iter == max_clip_iters:
                 break
 
-            # Compute per-stamp RMS residual
+            # Compute per-stamp RMS residual over valid pixels only
             reconstructed = V @ coeffs  # all stamps, not just kept
-            residuals = pixels - reconstructed
-            stamp_rms = np.sqrt(np.mean(residuals**2, axis=1))
+            res2 = (pixels - reconstructed) ** 2
+            if all_valid:
+                stamp_rms = np.sqrt(np.mean(res2, axis=1))
+            else:
+                nvalid = np.maximum(valid_pix.sum(axis=1), 1)
+                stamp_rms = np.sqrt(np.sum(res2 * valid_pix, axis=1) / nvalid)
 
             med_rms = np.median(stamp_rms[keep])
             mad_rms = np.median(np.abs(stamp_rms[keep] - med_rms)) * 1.4826
@@ -1244,9 +1329,12 @@ def _create_psf_model_polynomial(
 
     # Suppress low-S/N outer support where the polynomial fit otherwise tends
     # to create square-edge pedestals and ringing.
+    ref_stamps = (
+        stamps_array if all_valid else np.where(valid_array, stamps_array, np.nan)
+    )
     psf_data, taper_start, taper_width = _regularize_polynomial_psf(
         coeffs.reshape(ncoeffs, os_size, os_size),
-        stamps_array,
+        ref_stamps,
         keep,
         sampling,
         fwhm,
@@ -1261,8 +1349,12 @@ def _create_psf_model_polynomial(
     # Compute and report residual statistics
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
         reconstructed = V[keep] @ coeffs
-        residuals = pixels[keep] - reconstructed
-        rms = np.sqrt(np.nanmean(residuals**2))
+        res2 = (pixels[keep] - reconstructed) ** 2
+        if all_valid:
+            rms = np.sqrt(np.nanmean(res2))
+        else:
+            vk = valid_pix[keep]
+            rms = np.sqrt(np.nansum(res2 * vk) / max(int(vk.sum()), 1))
     log(
         'Polynomial PSF fit: %d x %d pixels, %d coefficients, '
         '%d/%d stamps used, RMS residual %.2e (per pixel, normalized)'

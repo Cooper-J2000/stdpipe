@@ -331,11 +331,13 @@ def _psf_centroid(image, x, y, psf, mask=None, box_size=None, maxiter=16, tol=1e
 
         data_cutout = image[y0:y1, x0:x1]
 
+        # Keep negative (background-subtracted noise) pixels: excluding them
+        # biases faint-source centroids towards positive noise fluctuations
         if mask is not None:
             mask_cutout = mask[y0:y1, x0:x1]
-            good = ~mask_cutout & np.isfinite(data_cutout) & (data_cutout > 0)
+            good = ~mask_cutout & np.isfinite(data_cutout)
         else:
-            good = np.isfinite(data_cutout) & (data_cutout > 0)
+            good = np.isfinite(data_cutout)
 
         if np.sum(good) < 3:
             return np.nan, np.nan
@@ -529,7 +531,7 @@ def _grouped_optimal_extraction(image, err, positions, psf, bg_local=None, mask=
 
     # Build design matrix with K PSF columns (+ optional background term)
     # Only fit background if bg_local was provided (i.e., we subtracted source-specific backgrounds)
-    fit_background = bg_local is not None and bg_offset != 0
+    fit_background = bg_local is not None and np.isfinite(bg_offset) and bg_offset != 0
     n_params = K + 1 if fit_background else K
     A = np.zeros((n_pix, n_params))
     psf_norms = np.zeros(K)
@@ -590,13 +592,15 @@ def _grouped_optimal_extraction(image, err, positions, psf, bg_local=None, mask=
     # Solve unweighted least squares (for flux consistency with single-source)
     x_sol, cov = _solve_weighted_leastsq(A, D, W)
 
-    # Scale covariance by variance for error estimation
-    # (flux errors still use variance properly)
+    # Propagate per-pixel variance through the unweighted solution via the
+    # sandwich formula: cov = (AᵀA)⁻¹ Aᵀ diag(V) A (AᵀA)⁻¹. For a single
+    # source this reduces exactly to ΣP²V/(ΣP²)², matching _optimal_extraction.
     if x_sol is not None and cov is not None:
-        # Adjust covariance to account for actual data variance
-        # For proper error estimation: scale cov by mean variance in aperture
-        mean_var = np.mean(V)
-        cov = cov * mean_var
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            AtVA = (A * V[:, np.newaxis]).T @ A
+            cov = cov @ AtVA @ cov
+        if not np.all(np.isfinite(cov)):
+            x_sol, cov = None, None
 
     if x_sol is None:
         # Matrix singularity - fall back to individual fitting
@@ -691,8 +695,8 @@ def _optimal_extraction(image, err, x, y, psf, bg_local=None, mask=None, radius=
     y0, y1 = iy - half, iy + half + 1
     x0, x1 = ix - half, ix + half + 1
 
-    # Handle edge cases
-    if y0 < 0 or x0 < 0 or y1 >= image.shape[0] or x1 >= image.shape[1]:
+    # Handle edge cases (slice ends are exclusive, so == shape is still valid)
+    if y0 < 0 or x0 < 0 or y1 > image.shape[0] or x1 > image.shape[1]:
         return np.nan, np.nan, 0, np.nan, np.nan
 
     data_cutout = image[y0:y1, x0:x1]
@@ -722,7 +726,9 @@ def _optimal_extraction(image, err, x, y, psf, bg_local=None, mask=None, radius=
     D = data_cutout[good]
     V = var[good]
 
-    if bg_local:
+    # Skip non-finite local background (failed annulus) rather than
+    # propagating NaN into the whole measurement
+    if bg_local is not None and np.isfinite(bg_local) and bg_local != 0:
         D -= bg_local
 
     # Simplified weighting: flux = Σ(P × D) / Σ(P²)

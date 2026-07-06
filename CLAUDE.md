@@ -259,7 +259,7 @@ Crowdsource-style (Schlafly et al.), computed in `photometry_quality.py` from ne
 
 **Advanced PSF Features:**
 - **Position-dependent PSF** (`use_position_dependent_psf=True`) - For wide-field imaging where PSF varies across the field. Evaluates PSFEx polynomial at each source position (constant, linear, quadratic terms). Slower but more accurate for fields with PSF variation.
-- **Grouped PSF fitting** (enabled by default, `group_sources=True`) - Fits nearby sources simultaneously to reduce neighbor contamination. Dramatically more accurate in crowded fields (51× improvement at 0.5 FWHM, 14× at 1.0 FWHM, 3× at 1.5 FWHM). No downside for isolated fields (identical results at >3 FWHM). Set `group_sources=False` only for sparse fields with performance constraints. Configure with `grouper_radius` (default: 2× PSF size).
+- **Grouped PSF fitting** (enabled by default, `group_sources=True`) - Fits nearby sources simultaneously to reduce neighbor contamination. Dramatically more accurate in crowded fields (51× improvement at 0.5 FWHM, 14× at 1.0 FWHM, 3× at 1.5 FWHM). No downside for isolated fields (identical results at >3 FWHM). Set `group_sources=False` only for sparse fields with performance constraints. Configure with `grouper_radius` (default: max(2.5×FWHM, fit_size/2)).
 - **Combined mode** - Both features can be used together for maximum accuracy in crowded, wide-field images.
 
 **Optimal Extraction Output Columns:**
