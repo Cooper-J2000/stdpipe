@@ -16,12 +16,54 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 
 from . import smoothing
+from .realbogus_features import FLAG_BOGUS, FLAGS_UNRELIABLE_MASK
+
+
+def _has_column(obj, name):
+    """Check whether a table-like or dict-like catalog has a column."""
+    colnames = getattr(obj, 'colnames', None)
+    if colnames is not None:
+        return name in colnames
+    if hasattr(obj, 'keys'):
+        return name in obj.keys()
+    names = getattr(getattr(obj, 'dtype', None), 'names', None)
+    return names is not None and name in names
+
+
+def _get_catalog_features(obj):
+    """
+    Build the feature list from available catalog columns.
+
+    Prefers SExtractor-style columns (FLUX_RADIUS, FLUX_MAX/FLUX_AUTO) and
+    falls back to SEP-style ones (peak/flux) where possible, so the same
+    filter works on both `get_objects_sextractor()` and `get_objects_sep()`
+    catalogs.
+    """
+    features = []
+
+    if _has_column(obj, 'FLUX_RADIUS'):
+        features.append([np.asarray(obj['FLUX_RADIUS'], dtype=float), 'FLUX_RADIUS'])
+
+    for name in ('fwhm', 'FWHM_IMAGE'):
+        if _has_column(obj, name):
+            features.append([np.asarray(obj[name], dtype=float), 'FWHM'])
+            break
+
+    for num, den in (('FLUX_MAX', 'FLUX_AUTO'), ('peak', 'flux')):
+        if _has_column(obj, num) and _has_column(obj, den):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = np.asarray(obj[num], dtype=float) / np.asarray(obj[den], dtype=float)
+            features.append([ratio, f'{num} / {den}'])
+            break
+
+    return features
 
 
 def filter_sextractor_detections(
     obj,
     trend_cols=['x', 'y', 'MAG_AUTO'],
-    trend_scales=[1000, 1000, 2],
+    trend_scales=None,
+    contamination='auto',
     return_features=False,
     return_classifier=False,
     random_state=0,
@@ -29,31 +71,39 @@ def filter_sextractor_detections(
     **kwargs,
 ):
     """
-    Flag SExtractor detections likely to be artefacts using IsolationForest.
+    Flag detections likely to be artefacts using IsolationForest.
 
-    Builds feature vectors from FLUX_RADIUS, FWHM, and FLUX_MAX/FLUX_AUTO.
-    Optionally removes smooth spatial trends (e.g., across x/y/MAG_AUTO) via an
-    approximate LOESS regressor before fitting the outlier model.
+    Builds feature vectors from FLUX_RADIUS, FWHM, and peakiness
+    (FLUX_MAX/FLUX_AUTO, or peak/flux for SEP catalogs), using whichever
+    columns are present. Optionally removes smooth spatial trends (e.g.,
+    across x/y/MAG_AUTO) via an approximate LOESS regressor before fitting
+    the outlier model.
 
     Expected columns in `obj`
     -------------------------
     Required:
-    - FLUX_RADIUS
-    - fwhm
-    - FLUX_MAX
-    - FLUX_AUTO
     - flags
+    - at least one of the feature columns: FLUX_RADIUS; fwhm or FWHM_IMAGE;
+      FLUX_MAX + FLUX_AUTO or peak + flux
     Trend columns (when `trend_cols` is set):
-    - columns named in `trend_cols` (default: x, y, MAG_AUTO)
+    - columns named in `trend_cols` (default: x, y, MAG_AUTO); missing ones
+      are dropped with a log message
 
     Parameters
     ----------
     obj : array-like / table
-        SExtractor catalog with required columns.
+        Detection catalog with required columns.
     trend_cols : list[str] or None
         Columns used to model smooth trends; set to None/[] to skip detrending.
-    trend_scales : list[float]
-        Per-dimension scaling for LOESS distances; must match trend_cols length.
+    trend_scales : list[float] or None
+        Per-dimension scaling for LOESS distances; must match trend_cols
+        length. If None (default), scales are auto-computed as ~3x the
+        standard deviation of each trend column.
+    contamination : float or 'auto'
+        Expected fraction of artefacts, passed to IsolationForest. With
+        'auto' (default) the threshold follows the original paper and a
+        data-dependent fraction is flagged even on clean catalogs; set an
+        explicit value (e.g. 0.02) to control the rejection rate.
     return_features : bool
         If True, return the feature list (arrays + labels) without fitting.
     return_classifier : bool
@@ -75,14 +125,13 @@ def filter_sextractor_detections(
     # Simple wrapper around print for logging in verbose mode only
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
-    def get_features(obj):
-        return [
-            [obj['FLUX_RADIUS'], 'FLUX_RADIUS'],
-            [obj['fwhm'], 'FWHM'],
-            [obj['FLUX_MAX'] / obj['FLUX_AUTO'], 'FLUX_MAX / FLUX_AUTO'],
-        ]
+    features = _get_catalog_features(obj)
 
-    features = get_features(obj)
+    if not features:
+        raise ValueError(
+            "No usable feature columns found in the catalog "
+            "(need FLUX_RADIUS, fwhm/FWHM_IMAGE, FLUX_MAX+FLUX_AUTO or peak+flux)"
+        )
 
     if return_features:
         return features
@@ -93,26 +142,60 @@ def filter_sextractor_detections(
         )
     )
 
-    # Exclude blends etc from the fit, as well as broken measurements
-    # also exclude 0x800 that we will use for outliers
-    idx = (obj['flags'] & (0x7FFF - 0x800)) == 0
+    # LOESS neighbor count; popped here so it does not leak into other kwargs
+    k = kwargs.pop('k', 20)
+
+    # Exclude blends etc from the fit, as well as broken measurements;
+    # FLAG_BOGUS itself is ignored so re-running the filter is idempotent
+    idx = (obj['flags'] & FLAGS_UNRELIABLE_MASK) == 0
     for f in features:
         idx &= np.isfinite(f[0]) & (f[0] > 0)
+
+    pos = None
+    if trend_cols:
+        # Drop trend columns missing from the catalog (keeping user-provided
+        # scales aligned with the surviving columns)
+        available = [_ for _ in trend_cols if _has_column(obj, _)]
+        if trend_scales is not None and len(trend_scales) != len(trend_cols):
+            raise ValueError("trend_scales length is inconsistent with trend_cols length")
+        if len(available) < len(trend_cols):
+            missing = [_ for _ in trend_cols if _ not in available]
+            log("Trend columns not found in catalog: {}".format(", ".join(missing)))
+            if trend_scales is not None:
+                trend_scales = [s for c, s in zip(trend_cols, trend_scales) if c in available]
+        trend_cols = available
 
     if trend_cols:
         log("Removing smooth trends in {} using approximate LOESS".format(", ".join(trend_cols)))
 
-        if trend_scales and len(trend_scales) != len(trend_cols):
-            raise ValueError("trend_scales length is inconsistent with trend_cols length")
+        if trend_scales is None:
+            # Auto-compute per-dimension scales as ~3 sigma of each column
+            trend_scales = []
+            for col in trend_cols:
+                scale = 3.0 * np.nanstd(np.asarray(obj[col], dtype=float))
+                if not np.isfinite(scale) or scale <= 0:
+                    scale = 1.0
+                trend_scales.append(scale)
+            log(
+                "Auto trend scales: {}".format(
+                    ", ".join([f"{c}={s:.3g}" for c, s in zip(trend_cols, trend_scales)])
+                )
+            )
 
         pos = np.column_stack([np.array(obj[_]) for _ in trend_cols])
         # Rows with non-finite trend columns cannot be detrended and would
         # get NaN features anyway; keep them out of the fits below
         idx &= np.all(np.isfinite(pos), axis=1)
+
+    if np.sum(idx) < 3:
+        raise ValueError(
+            f"Too few clean detections ({np.sum(idx)}) to fit the outlier model"
+        )
+
+    if trend_cols:
         trend_models = []
         X = []
 
-        k = kwargs.pop('k', 20)
         for f in features:
             model = smoothing.ApproxLoessRegressor(k=k, scales=trend_scales, **kwargs)
             model.fit(pos[idx], f[0][idx])
@@ -126,7 +209,7 @@ def filter_sextractor_detections(
     X = np.column_stack(X)
     X[~np.isfinite(X)] = -100000  # Definitely outside of the good locus
 
-    clf = IsolationForest(random_state=random_state).fit(X[idx])
+    clf = IsolationForest(contamination=contamination, random_state=random_state).fit(X[idx])
 
     res = clf.predict(X)
 
@@ -135,7 +218,7 @@ def filter_sextractor_detections(
     if return_classifier:
 
         def classifier(obj):
-            features = get_features(obj)
+            features = _get_catalog_features(obj)
 
             if trend_cols:
                 pos = np.column_stack([np.array(obj[_]) for _ in trend_cols])
@@ -160,6 +243,7 @@ def filter_detections(
     obj,
     image=None,
     bg=None,
+    err=None,
     mask=None,
     fwhm=None,
     method='auto',
@@ -185,11 +269,14 @@ def filter_detections(
     Parameters
     ----------
     obj : astropy.table.Table
-        Object catalog with 'x', 'y' columns.
+        Object catalog with 'x', 'y' columns. Modified in place when
+        `add_score` or `flag_bogus` is set.
     image : ndarray, optional
         Science image. If provided, cutout features will be extracted.
     bg : ndarray or float, optional
         Background map or scalar.
+    err : ndarray or float, optional
+        Error/noise map or scalar.
     mask : ndarray, optional
         Boolean mask (True = masked).
     fwhm : float, optional
@@ -213,9 +300,10 @@ def filter_detections(
     trend_scales : list of float, optional
         Scales for trend removal. Default: auto-computed.
     add_score : bool, optional
-        Add 'rb_score' column to output. Default: False.
+        Add 'rb_score' column to the input catalog. Default: False.
     flag_bogus : bool, optional
-        Set flag 0x800 on bogus objects. Default: False.
+        Set FLAG_BOGUS (0x4000) on bogus objects in the input catalog.
+        Default: False.
     verbose : bool, optional
         Print progress.
     **kwargs
@@ -247,17 +335,19 @@ def filter_detections(
 
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
-    # Call the full classify function
+    # Call the full classify function; the score is always needed to build
+    # the output mask
     result = rbf.classify(
         obj,
         image=image,
         bg=bg,
+        err=err,
         mask=mask,
         fwhm=fwhm,
         method=method,
         classifier=classifier,
         threshold=threshold,
-        add_score=add_score or True,  # Need score to compute mask
+        add_score=True,
         flag_bogus=flag_bogus,
         remove_trend=remove_trend,
         trend_cols=trend_cols,
@@ -266,8 +356,14 @@ def filter_detections(
         **kwargs,
     )
 
-    # Return boolean mask
-    good = result['rb_score'] >= threshold
+    good = np.asarray(result['rb_score'] >= threshold)
+
+    # classify() works on a copy; propagate the requested columns back to
+    # the caller's catalog so add_score/flag_bogus have a visible effect
+    if add_score:
+        obj['rb_score'] = result['rb_score']
+    if flag_bogus:
+        obj['flags'] = result['flags']
 
     log(f"{np.sum(good)} good, {np.sum(~good)} outliers")
 

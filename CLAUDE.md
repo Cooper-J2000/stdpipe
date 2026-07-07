@@ -277,6 +277,9 @@ Crowdsource-style (Schlafly et al.), computed in `photometry_quality.py` from ne
 - `0x1000` - PSF fit failed (NaN result)
 - `0x2000` - Large centroid shift during fit (>1 pixel)
 
+**Real-Bogus Flags (`flags` column, set by artefacts/realbogus/realbogus_features):**
+- `0x4000` - Object classified as bogus by real-bogus filtering (`FLAG_BOGUS` in `realbogus_features`)
+
 **Examples:**
 ```python
 from stdpipe import photometry, photometry_psf, psf

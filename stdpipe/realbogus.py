@@ -37,6 +37,8 @@ import os
 import warnings
 from astropy.table import Column
 
+from .realbogus_features import FLAG_BOGUS
+
 # Conditional TensorFlow import
 try:
     import tensorflow as tf
@@ -516,11 +518,17 @@ def extract_cutouts(
     for i, row in enumerate(obj):
         x, y = row['x'], row['y']
 
-        # Check bounds
-        x_min = int(x - radius)
-        x_max = int(x + radius + 1)
-        y_min = int(y - radius)
-        y_max = int(y + radius + 1)
+        if not (np.isfinite(x) and np.isfinite(y)):
+            log(f"Object {i} has non-finite position, skipping")
+            continue
+
+        # Center the cutout on the nearest pixel, consistent with
+        # realbogus_features._extract_cutout
+        xc, yc = int(round(x)), int(round(y))
+        x_min = xc - radius
+        x_max = xc + radius + 1
+        y_min = yc - radius
+        y_max = yc + radius + 1
 
         if x_min < 0 or x_max > w or y_min < 0 or y_max > h:
             log(f"Object {i} too close to edge, skipping")
@@ -709,7 +717,8 @@ def classify_realbogus(
     add_score : bool, optional
         Add 'rb_score' column to output catalog. Default: True
     flag_bogus : bool, optional
-        Set flags=0x1000 for bogus objects and filter them out. Default: True
+        Set FLAG_BOGUS (0x4000) for bogus objects and filter them out.
+        Default: True
     batch_size : int, optional
         Batch size for inference. Default: 128
     verbose : bool or callable, optional
@@ -719,7 +728,8 @@ def classify_realbogus(
     -------
     obj_filtered : astropy.table.Table
         Filtered catalog with real sources only (if flag_bogus=True)
-        or full catalog with 'rb_score' column (if flag_bogus=False)
+        or full catalog with 'rb_score' column (if flag_bogus=False).
+        The input catalog is not modified; a copy is returned.
 
     Examples
     --------
@@ -736,6 +746,9 @@ def classify_realbogus(
     # Load model if not provided
     if model is None:
         model = load_realbogus_model(model_file=model_file, verbose=verbose)
+
+    # Make a copy to avoid modifying the input catalog
+    obj = obj.copy()
 
     cutout_radius = _infer_cutout_radius_from_model(model, default_radius=15, log=log)
 
@@ -778,10 +791,10 @@ def classify_realbogus(
         if 'flags' not in obj.colnames:
             obj.add_column(Column(np.zeros(len(obj), dtype=int), name='flags'))
 
-        # Set bogus flag (0x1000)
+        # Set bogus flag
         is_bogus = full_scores < threshold
         is_bogus[np.isnan(full_scores)] = True  # Flag invalid objects as bogus
-        obj['flags'][is_bogus] |= 0x1000
+        obj['flags'][is_bogus] |= FLAG_BOGUS
 
         # Filter
         obj_filtered = obj[~is_bogus]

@@ -40,6 +40,16 @@ from astropy.table import Column
 from . import smoothing
 
 
+# Catalog flag bit marking objects classified as bogus. Dedicated bit that
+# does not collide with detection flags or with photometry flags
+# (0x800 = optimal extraction failed, 0x1000 = PSF fit failed / poor fit,
+# 0x2000 = large centroid shift).
+FLAG_BOGUS = 0x4000
+
+# Flags marking a detection/measurement as unreliable; FLAG_BOGUS itself is
+# excluded so that re-running the classification remains idempotent
+FLAGS_UNRELIABLE_MASK = 0x7FFF & ~FLAG_BOGUS
+
 _VALID_FEATURE_SETS = ("default", "minimal", "extended")
 _FEATURE_SET_LEVELS = {
     "minimal": {"minimal"},
@@ -154,7 +164,10 @@ _CATALOG_FEATURE_SPECS = [
     ("elongation", "minimal", _compute_catalog_elongation),
     ("fwhm_ratio", "minimal", _compute_catalog_fwhm_ratio),
     ("radius_fwhm_ratio", "default", _compute_catalog_radius_fwhm_ratio),
-    ("snr", "default", _compute_catalog_snr),
+    # snr is a brightness feature, not a morphology one: under IsolationForest
+    # the brightest genuine stars become outliers on this axis, so it is only
+    # included in the opt-in 'extended' set
+    ("snr", "extended", _compute_catalog_snr),
 ]
 
 
@@ -422,26 +435,6 @@ def _compute_cutout_snr(cutout, cutout_err):
     return signal / np.sqrt(err2)
 
 
-def _get_cutout_feature_specs(include_snr=False):
-    """Build cutout feature extraction specs.
-
-    Each spec is (name, fn(cutout, geom, cutout_err, fwhm) -> float).
-    """
-    specs = [
-        ("sharpness", lambda c, _g, _e, _f: _compute_sharpness(c)),
-        ("concentration", lambda c, g, _e, _f: _compute_concentration(c, g)),
-        ("symmetry", lambda c, g, _e, _f: _compute_symmetry(c, g)),
-        ("roundness", lambda c, g, _e, _f: _compute_roundness(c, g)),
-        ("psf_match", lambda c, g, _e, f: _compute_psf_match(c, g, f)),
-        ("peak_offset", lambda c, g, _e, _f: _compute_peak_offset(c, g)),
-        ("edge_gradient", lambda c, g, _e, _f: _compute_edge_gradient(c, g)),
-        ("bg_consistency", lambda c, g, _e, _f: _compute_background_consistency(c, g)),
-    ]
-    if include_snr:
-        specs.append(("cutout_snr", lambda c, _g, e, _f: _compute_cutout_snr(c, e)))
-    return specs
-
-
 def extract_cutout_features(
     obj, image, bg=None, err=None, mask=None, fwhm=None, radius=10, verbose=False
 ):
@@ -487,15 +480,32 @@ def extract_cutout_features(
             fwhm = 3.0
         log(f"Estimated FWHM: {fwhm:.2f} pixels")
 
-    feature_specs = _get_cutout_feature_specs(include_snr=err is not None)
-    features = {name: np.full(n, np.nan) for name, _fn in feature_specs}
+    compute_snr = err is not None
+    feature_names = [
+        "sharpness",
+        "concentration",
+        "symmetry",
+        "roundness",
+        "psf_match",
+        "peak_offset",
+        "edge_gradient",
+        "bg_consistency",
+    ]
+    if compute_snr:
+        feature_names.append("cutout_snr")
+    features = {name: np.full(n, np.nan) for name in feature_names}
+
+    # Plain arrays: per-row astropy Table access is much slower
+    xs = np.asarray(obj["x"], dtype=float)
+    ys = np.asarray(obj["y"], dtype=float)
 
     # Process each object
-    for i, row in enumerate(obj):
-        x, y = row["x"], row["y"]
+    for i in range(n):
+        if not (np.isfinite(xs[i]) and np.isfinite(ys[i])):
+            continue
 
         cutout, cutout_mask, cutout_err = _extract_cutout(
-            image, x, y, radius, bg=bg, err=err, mask=mask
+            image, xs[i], ys[i], radius, bg=bg, err=err, mask=mask
         )
 
         if cutout is None:
@@ -514,10 +524,17 @@ def extract_cutout_features(
         # Pre-compute geometry once per cutout (shared across features)
         geom = _CutoutGeometry(cutout.shape)
 
-        for name, compute_fn in feature_specs:
-            features[name][i] = compute_fn(cutout, geom, cutout_err, fwhm)
+        features["sharpness"][i] = _compute_sharpness(cutout)
+        features["concentration"][i] = _compute_concentration(cutout, geom)
+        features["symmetry"][i] = _compute_symmetry(cutout, geom)
+        features["roundness"][i] = _compute_roundness(cutout, geom)
+        features["psf_match"][i] = _compute_psf_match(cutout, geom, fwhm)
+        features["peak_offset"][i] = _compute_peak_offset(cutout, geom)
+        features["edge_gradient"][i] = _compute_edge_gradient(cutout, geom)
+        features["bg_consistency"][i] = _compute_background_consistency(cutout, geom)
+        if compute_snr:
+            features["cutout_snr"][i] = _compute_cutout_snr(cutout, cutout_err)
 
-    feature_names = list(features.keys())
     log(f"Extracted {len(feature_names)} cutout features for {n} objects")
 
     return features, feature_names
@@ -621,7 +638,7 @@ class TrendModels(dict):
 
 
 def _coerce_trend_models(trend_models):
-    """Normalize legacy/new trend model containers to TrendModels."""
+    """Normalize trend model containers to TrendModels."""
     if trend_models is None:
         return TrendModels()
 
@@ -629,9 +646,7 @@ def _coerce_trend_models(trend_models):
         return trend_models
 
     if isinstance(trend_models, dict):
-        legacy_cols = trend_models.get("__trend_cols__")
-        models = {k: v for k, v in trend_models.items() if k != "__trend_cols__"}
-        return TrendModels(models, trend_cols=legacy_cols)
+        return TrendModels(trend_models, trend_cols=None)
 
     raise TypeError("trend_models must be a dict-like object returned by remove_trends()")
 
@@ -709,12 +724,15 @@ def remove_trends(
     # Build position array
     pos = np.column_stack([np.array(obj[c]) for c in trend_cols])
 
-    # Find valid (unflagged) objects for fitting
+    # Rows where the trend can be evaluated at all
+    finite_pos = np.all(np.isfinite(pos), axis=1)
+
+    # Rows used for fitting: additionally require clean flags
     if "flags" in obj.colnames:
-        base_valid_idx = (obj["flags"] & 0x7FF) == 0  # Exclude flagged objects
+        base_valid_idx = (obj["flags"] & FLAGS_UNRELIABLE_MASK) == 0
     else:
         base_valid_idx = np.ones(len(obj), dtype=bool)
-    base_valid_idx &= np.all(np.isfinite(pos), axis=1)
+    base_valid_idx &= finite_pos
 
     detrended = {}
     trend_models = TrendModels(trend_cols=trend_cols)
@@ -742,12 +760,14 @@ def remove_trends(
             )
             model.fit(pos[valid_idx], arr[valid_idx])
 
-            # Remove trend
+            # Subtract the trend from every row with finite positions -- not
+            # just the clean fit subset -- so flagged objects end up in the
+            # same residual feature space as everything else
             detrended_arr = arr.copy()
             trend_rms = np.nan
-            if np.any(base_valid_idx):
-                trend = model.predict(pos[base_valid_idx])
-                detrended_arr[base_valid_idx] = arr[base_valid_idx] - trend
+            if np.any(finite_pos):
+                trend = model.predict(pos[finite_pos])
+                detrended_arr[finite_pos] = arr[finite_pos] - trend
                 trend_rms = np.nanstd(trend)
             detrended[name] = detrended_arr
             trend_models[name] = model
@@ -772,8 +792,7 @@ def apply_trend_models(features, obj, trend_models, trend_cols=None):
     obj : astropy.table.Table
         Object catalog.
     trend_models : TrendModels or dict
-        Trend models from remove_trends(). Legacy dicts with ``'__trend_cols__'``
-        are also accepted.
+        Trend models from remove_trends().
     trend_cols : list of str, optional
         Columns used for trend modeling. Must match original.
 
@@ -1280,9 +1299,10 @@ def classify(
     add_score : bool, optional
         Add 'rb_score' column to output. Default: True.
     flag_bogus : bool, optional
-        Set flag 0x800 on bogus objects. Default: True.
+        Set FLAG_BOGUS (0x4000) on bogus objects. Default: True.
     remove_trend : bool, optional
-        Remove spatial trends from features. Default: True.
+        Remove spatial trends from features. Default: True. Ignored for the
+        'scoring' classifier, whose rules expect raw feature values.
     trend_cols : list of str, optional
         Columns for trend removal. Default: ['x', 'y'].
     trend_scales : list of float, optional
@@ -1296,12 +1316,24 @@ def classify(
     -------
     obj : astropy.table.Table
         Input catalog with added 'rb_score' column (if add_score=True)
-        and updated flags (if flag_bogus=True).
+        and updated flags (if flag_bogus=True). Objects with no valid
+        features at all (e.g. too close to the image edge for cutout
+        extraction) get rb_score=0 and are classified as bogus.
     """
     log = print if verbose else lambda *args, **kwargs: None
 
     # Make a copy to avoid modifying input
     obj = obj.copy()
+
+    # Get or create classifier
+    clf, fit_on_current_features = _build_classifier_for_inference(classifier, model=model)
+
+    # Scoring rules are calibrated on raw feature values (e.g. roundness ~ 0.9
+    # for stars); detrended residuals are centered near zero and would be
+    # systematically mis-scored, so trend removal is disabled for this path
+    if remove_trend and isinstance(clf, ScoringClassifier):
+        log("Skipping trend removal: scoring rules expect raw feature values")
+        remove_trend = False
 
     # Extract features
     log(f"Extracting features using method='{method}'")
@@ -1326,14 +1358,32 @@ def classify(
             features, obj, trend_cols=trend_cols, trend_scales=trend_scales, verbose=verbose
         )
 
-    # Get or create classifier
-    clf, fit_on_current_features = _build_classifier_for_inference(classifier, model=model)
+    X, _ = _features_to_array(features, feature_names, replace_nonfinite=False)
+
     if fit_on_current_features:
-        log("Fitting IsolationForest on current data")
-        clf.fit(features)
+        # Fit on objects with clean flags only, so blends and broken
+        # measurements do not contaminate the outlier model
+        fit_idx = np.all(np.isfinite(X), axis=1)
+        if "flags" in obj.colnames:
+            fit_idx &= np.asarray((obj["flags"] & FLAGS_UNRELIABLE_MASK) == 0)
+        if np.sum(fit_idx) >= 3:
+            log(f"Fitting IsolationForest on {np.sum(fit_idx)} clean objects")
+            clf.fit({name: arr[fit_idx] for name, arr in features.items()})
+        else:
+            log("Too few clean objects, fitting IsolationForest on all data")
+            clf.fit(features)
 
     # Predict
-    scores = clf.predict_proba(features)
+    scores = np.asarray(clf.predict_proba(features), dtype=float)
+
+    # Objects with no valid features at all (e.g. too close to the image
+    # edge for cutout extraction) cannot be classified; treat them as bogus
+    # uniformly across classifiers
+    no_valid = ~np.any(np.isfinite(X), axis=1)
+    if np.any(no_valid):
+        log(f"{np.sum(no_valid)} objects have no valid features, marking as bogus")
+        scores[no_valid] = 0.0
+
     predictions = np.where(scores >= threshold, 1, -1)
 
     n_real = np.sum(predictions > 0)
@@ -1352,8 +1402,8 @@ def classify(
         if "flags" not in obj.colnames:
             obj.add_column(Column(np.zeros(len(obj), dtype=np.int32), name="flags"))
         # Reset existing bogus bit so output reflects this classification pass.
-        obj["flags"] &= ~0x800
-        obj["flags"][predictions < 0] |= 0x800
+        obj["flags"] &= ~FLAG_BOGUS
+        obj["flags"][predictions < 0] |= FLAG_BOGUS
 
     return obj
 

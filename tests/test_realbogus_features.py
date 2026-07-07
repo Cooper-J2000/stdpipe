@@ -244,6 +244,9 @@ class TestHybridFeatures:
     @pytest.mark.unit
     def test_feature_set_passthrough(self, simple_catalog):
         """extract_features should honor catalog feature_set selection."""
+        extended_features, _ = rbf.extract_features(
+            simple_catalog, image=None, method='catalog', feature_set='extended'
+        )
         default_features, _ = rbf.extract_features(
             simple_catalog, image=None, method='catalog', feature_set='default'
         )
@@ -251,8 +254,11 @@ class TestHybridFeatures:
             simple_catalog, image=None, method='catalog', feature_set='minimal'
         )
 
-        assert 'snr' in default_features
-        assert 'snr' not in minimal_features
+        # snr is a brightness feature, only in the opt-in extended set
+        assert 'snr' in extended_features
+        assert 'snr' not in default_features
+        assert 'radius_fwhm_ratio' in default_features
+        assert 'radius_fwhm_ratio' not in minimal_features
 
 
 # =============================================================================
@@ -546,7 +552,7 @@ class TestClassifyAPI:
 
         assert 'rb_score' in result.colnames
         # Check that some objects are flagged
-        flagged = result['flags'] & 0x800
+        flagged = result['flags'] & rbf.FLAG_BOGUS
         assert np.any(flagged > 0) or np.all(result['rb_score'] >= 0.5)
 
     @pytest.mark.unit
@@ -598,9 +604,9 @@ class TestClassifyAPI:
 
     @pytest.mark.unit
     def test_classify_clears_previous_bogus_flag(self, simple_catalog):
-        """Reclassification should overwrite stale 0x800 bogus flags."""
+        """Reclassification should overwrite stale bogus flags."""
         obj = simple_catalog.copy()
-        obj['flags'] |= 0x800
+        obj['flags'] |= rbf.FLAG_BOGUS
 
         result = rbf.classify(
             obj,
@@ -612,7 +618,7 @@ class TestClassifyAPI:
             flag_bogus=True
         )
 
-        assert np.all((result['flags'] & 0x800) == 0)
+        assert np.all((result['flags'] & rbf.FLAG_BOGUS) == 0)
 
 
 class TestTraining:
