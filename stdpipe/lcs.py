@@ -8,19 +8,18 @@ from scipy.spatial import cKDTree
 from . import astrometry
 
 
-# Fast-conversion registry for types whose element-by-element iteration is
-# catastrophically slow (e.g. astropy.time.Time, where list.extend() on a
-# ~3.5 M-row column boxes each scalar individually and takes ~20 s).
+# Fast-conversion registry for types that cannot be stored directly as
+# ndarray chunks (e.g. astropy.time.Time).
 #
-# Each handler is a callable ``handler(val) -> (storage_array, finalizer)``:
-#   * ``storage_array`` is an ndarray of fast-iterating scalars (typically
-#     float64) that is appended to the per-key Python list.
-#   * ``finalizer`` is called once during :meth:`LCs.cluster` consolidation
-#     as ``finalizer(ndarray) -> typed_object`` to rebuild the original
+# Each handler is a callable ``handler(val) -> (storage_values, finalizer)``:
+#   * ``storage_values`` is an ndarray (or scalar) of plain numbers
+#     (typically float64) that is stored in place of the original value.
+#   * ``finalizer`` is called once during column consolidation as
+#     ``finalizer(ndarray) -> typed_object`` to rebuild the original
 #     container from the accumulated storage values.
 #
-# To add support for another slow-iterating type, append a (predicate,
-# handler) tuple to ``_FAST_TYPE_HANDLERS``.
+# To add support for another such type, append a (predicate, handler)
+# tuple to ``_FAST_TYPE_HANDLERS``.
 
 
 def _time_handler(val):
@@ -28,6 +27,10 @@ def _time_handler(val):
     scale, fmt = val.scale, val.format
 
     def finalize(arr):
+        # Rows padded with NaN (missing values) become masked Time entries,
+        # as Time rejects non-finite plain doubles
+        if np.any(np.isnan(arr)):
+            arr = np.ma.masked_invalid(arr)
         out = Time(arr, format='mjd', scale=scale)
         if fmt != 'mjd':
             out.format = fmt
@@ -48,6 +51,36 @@ def _fast_storage_handler(val):
     return None
 
 
+def _vector_length(val):
+    """Length of a vector-like value, or None for scalars, strings and None."""
+    if val is None or isinstance(val, str):
+        return None
+    try:
+        return len(val)
+    except TypeError:
+        # Objects like scalar Time define __len__ but raise on scalars
+        return None
+
+
+class _PadChunk:
+    """
+    Placeholder for rows without a value for a given key.
+
+    The actual fill value and dtype are decided lazily during column
+    consolidation, once the dtype of the real chunks is known: NaN for
+    floating-point columns (including fast-converted types like Time),
+    None (object dtype) otherwise.
+    """
+
+    __slots__ = ('n',)
+
+    def __init__(self, n):
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+
 class LCs:
     """
     Container for light-curve data vectors with spatial clustering utilities.
@@ -58,7 +91,14 @@ class LCs:
 
     Notes
     -----
-    - `add()` broadcasts scalars to the length of the longest input vector.
+    - `add()` broadcasts scalars to the length of the vector inputs, which
+      must all share the same length. Keys omitted from a call, and rows
+      preceding the first appearance of a new key, are padded so that all
+      stored vectors stay aligned: with NaN for floating-point columns
+      (missing Time entries become masked), with None (object dtype)
+      otherwise.
+    - Data vectors are stored as per-key lists of ndarray chunks and
+      consolidated lazily into single arrays on first attribute access.
     - `cluster()` refines centroids and can call an `analyze(self, ids)` callback
       per cluster.
     - Coordinate jitter is applied when building the KDTree to avoid degeneracy
@@ -72,23 +112,36 @@ class LCs:
     """
 
     def __init__(self):
-        # Storage for user-supplied data vectors
+        # Storage for user-supplied data vectors: key -> list of ndarray chunks
         self._params = {}
+        # Cache of consolidated (concatenated and finalized) columns
+        self._columns = {}
         # Per-key finalizer callables for keys whose values were stored via
         # the fast-conversion path (see ``_FAST_TYPE_HANDLERS``). Applied
-        # during :meth:`cluster` consolidation to restore the original type.
+        # during consolidation to restore the original type.
         self._finalizers = {}
+        # Total number of stored rows
+        self._length = 0
+        # Data version, and the (version, col_ra, col_dec) the KDTree was built from
+        self._version = 0
+        self._kd_key = None
 
         self.lcs = None
         self.kd = None
 
     def __getattr__(self, name):
-        # Allows direct access to stored data vectors
-        if name in self._params:
-            return self._params.get(name)
+        # Allows direct access to stored data vectors. Underscored names never
+        # resolve here, so the `self._params` access below cannot recurse when
+        # the instance dict is not yet populated (e.g. during unpickling).
+        if name.startswith('_'):
+            raise AttributeError(name)
 
-        else:
-            raise AttributeError
+        if name in self._params:
+            return self._get_column(name)
+
+        raise AttributeError(
+            "'%s' object has no attribute '%s'" % (self.__class__.__name__, name)
+        )
 
     def __dir__(self):
         # For auto-completion of stored data vectors names
@@ -98,14 +151,65 @@ class LCs:
             + list(self._params.keys())
         )
 
+    def _materialize_pads(self, name, chunks):
+        """Convert _PadChunk placeholders to arrays of NaN or None."""
+        real = [_ for _ in chunks if not isinstance(_, _PadChunk)]
+        dtype = np.result_type(*real) if real else None
+
+        if (dtype is not None and dtype.kind in 'fc') or (
+            dtype is None and name in self._finalizers
+        ):
+            # Floating-point columns (including fast-converted types whose
+            # storage is numeric) can hold NaN without dtype degradation
+            fill = np.nan
+            fill_dtype = dtype if dtype is not None else np.float64
+        else:
+            fill = None
+            fill_dtype = object
+
+        return [
+            np.full(len(_), fill, dtype=fill_dtype) if isinstance(_, _PadChunk) else _
+            for _ in chunks
+        ]
+
+    def _get_column(self, name):
+        """Return the consolidated (concatenated and finalized) vector for a key."""
+        if name not in self._columns:
+            chunks = self._params[name]
+
+            if any(isinstance(_, _PadChunk) for _ in chunks):
+                chunks = self._materialize_pads(name, chunks)
+                self._params[name] = chunks
+
+            if not chunks:
+                arr = np.array([])
+            elif len(chunks) == 1:
+                arr = np.asanyarray(chunks[0])
+            else:
+                arr = np.concatenate(chunks)
+                # Keep the single consolidated chunk so repeated access is cheap
+                self._params[name] = [arr]
+
+            finalizer = self._finalizers.get(name)
+            if finalizer is not None:
+                arr = finalizer(arr)
+
+            self._columns[name] = arr
+
+        return self._columns[name]
+
     def add(self, **kwargs):
         """
         Add per-detection vectors to the container.
 
-        Each keyword defines a stored vector. Scalars are broadcast to the length
-        of the longest input vector, and missing values are filled with None.
-        This method may be called repeatedly to append new chunks of measurements
-        (e.g., per-image batches) to the existing vectors.
+        Each keyword defines a stored vector. Scalars are broadcast to the
+        length of the vector inputs, which must all share the same length
+        (ValueError is raised otherwise). This method may be called repeatedly
+        to append new chunks of measurements (e.g., per-image batches) to the
+        existing vectors. Previously stored keys omitted from a call, as well
+        as rows preceding the first appearance of a new key, are padded so
+        that all stored vectors stay aligned - with NaN for floating-point
+        columns (missing Time entries become masked), with None otherwise.
 
         Examples
         --------
@@ -113,45 +217,54 @@ class LCs:
         >>> lcs.add(ra=[1, 2], dec=[3, 4], flux=10.0)
         """
 
-        def extend(col, val, length, key):
-            if (
-                val is not None
-                and hasattr(val, "__len__")
-                and not isinstance(val, str)
-                and len(val) == length
-            ):
-                # Some array-likes (notably astropy.time.Time) iterate so
-                # slowly element-by-element that ``list.extend(val)`` becomes
-                # the bottleneck. Route them through a fast bulk-conversion
-                # path; the original type is restored during ``cluster()``.
-                handler = _fast_storage_handler(val)
-                if handler is not None:
-                    storage_arr, finalizer = handler(val)
-                    col.extend(storage_arr.tolist())
-                    self._finalizers.setdefault(key, finalizer)
-                elif hasattr(val, 'tolist'):
-                    # ndarray / astropy.table.Column: bulk C-level conversion
-                    # avoids the ~10x slowdown of per-element iteration in
-                    # ``list.extend(Column)``.
-                    col.extend(val.tolist())
-                else:
-                    col.extend(val)
-            elif val is not None:
-                col.extend(np.repeat(val, length))
-            else:
-                col.extend(np.repeat(None, length))
+        # All vector inputs must agree on the chunk length
+        vec_lengths = {}
+        for key, val in kwargs.items():
+            n = _vector_length(val)
+            if n is not None:
+                vec_lengths[key] = n
 
-        # Estimate vector length from input data - for now, just as a max length of individual values
-        length = 0
-        for _ in kwargs:
-            if hasattr(kwargs[_], '__len__') and not isinstance(kwargs[_], str):
-                length = max(length, len(kwargs[_]))
+        if len(set(vec_lengths.values())) > 1:
+            raise ValueError(
+                'Mismatched vector lengths in add(): '
+                + ', '.join('%s has %d' % _ for _ in vec_lengths.items())
+            )
 
-        for key in kwargs:
+        length = next(iter(vec_lengths.values()), 0)
+
+        for key in set(kwargs) | set(self._params):
             if key not in self._params:
-                self._params[key] = []
+                # New key: backfill rows stored before it first appeared
+                self._params[key] = (
+                    [_PadChunk(self._length)] if self._length else []
+                )
 
-            extend(self._params[key], kwargs[key], length, key)
+            val = kwargs.get(key)
+
+            # Types like astropy.time.Time cannot be stored as plain ndarray
+            # chunks; convert them to numeric storage values and remember the
+            # finalizer that restores the original type during consolidation
+            handler = _fast_storage_handler(val)
+            if handler is not None:
+                val, finalizer = handler(val)
+                self._finalizers.setdefault(key, finalizer)
+
+            if _vector_length(val) is not None:
+                chunk = np.asanyarray(val)
+            elif val is not None:
+                # Broadcast scalar to the common vector length
+                chunk = np.full(length, val)
+            else:
+                # Key omitted from this call, or explicit None
+                chunk = _PadChunk(length)
+
+            if len(chunk):
+                self._params[key].append(chunk)
+
+        self._length += length
+        # Invalidate consolidated columns and KDTree built from previous data
+        self._columns = {}
+        self._version += 1
 
     def cluster(
         self,
@@ -163,6 +276,7 @@ class LCs:
         analyze=None,
         N=1000,
         max_refine_iter=1,
+        rng=0,
     ):
         """
         Spatially cluster the data vectors using ra/dec values stored in `col_ra` and `col_dec`.
@@ -182,11 +296,25 @@ class LCs:
         analyze : callable or None, optional
             Optional callback `analyze(self, ids)` called per accepted cluster.
             Any returned mapping entries are appended into `self.lcs` under their
-            respective keys (one entry per cluster).
+            respective keys (one entry per cluster). The callback may also
+            return None to skip reporting for a given cluster.
         N : int, optional
             Progress update interval in points.
         max_refine_iter : int, optional
             Maximum number of centroid refinement iterations (default 1).
+        rng : int, numpy.random.Generator, or None, optional
+            Seed or generator for the coordinate jitter used to break KDTree
+            degeneracies from repeated positions. The default fixed seed makes
+            clustering deterministic; pass None for non-deterministic jitter.
+
+        Notes
+        -----
+        Clustering is greedy in storage order: every not-yet-masked point seeds
+        a radius search, and all points within the refined cluster radius are
+        excluded from seeding afterwards. Such points may still be claimed as
+        members of later clusters, so nearby clusters can share points. For
+        point distributions wider than `sr`, the exact set of clusters may
+        depend on the ordering of the stored points.
         """
 
         log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
@@ -194,26 +322,27 @@ class LCs:
         if min_length is None:
             min_length = 0
 
-        sr0 = np.deg2rad(sr)
+        # Clustering radius as 3-D chord length corresponding to the angular radius
+        sr0 = 2 * np.sin(np.deg2rad(sr) / 2)
 
-        if type(self._params[col_ra]) is not np.ndarray:
-            log('Converting arrays')
+        for col in (col_ra, col_dec):
+            if col not in self._params:
+                raise KeyError("Column '%s' is not stored in the container" % col)
 
-            for name in self._params:
-                arr = np.array(self._params[name])
-                finalizer = self._finalizers.get(name)
-                if finalizer is not None:
-                    arr = finalizer(arr)
-                self._params[name] = arr
+        kd_key = (self._version, col_ra, col_dec)
+        if self._kd_key != kd_key:
+            log('Building positional KDTree')
 
             self._xarr, self._yarr, self._zarr = astrometry.radectoxyz(
-                self._params[col_ra], self._params[col_dec]
+                self._get_column(col_ra), self._get_column(col_dec)
             )
             # Add some additional jitter to coordinates, or KDTree may hang on repeating positions
-            self._xarr = np.random.normal(self._xarr, 0.01 / 206265)
-            self._yarr = np.random.normal(self._yarr, 0.01 / 206265)
-            self._zarr = np.random.normal(self._zarr, 0.01 / 206265)
+            gen = np.random.default_rng(rng)
+            self._xarr = gen.normal(self._xarr, 0.01 / 206265)
+            self._yarr = gen.normal(self._yarr, 0.01 / 206265)
+            self._zarr = gen.normal(self._zarr, 0.01 / 206265)
             self.kd = cKDTree(np.array([self._xarr, self._yarr, self._zarr]).T)
+            self._kd_key = kd_key
 
         def refine_pos(x, y, z):
             """Returns mean position for a list of individual positions"""
@@ -230,7 +359,7 @@ class LCs:
         zarr = self._zarr
         kd = self.kd
 
-        vmask = np.zeros_like(self._params[col_ra], bool)
+        vmask = np.zeros(len(xarr), bool)
 
         self.lcs = {'x': [], 'y': [], 'z': [], 'N': [], 'ids': []}
         lcs_x = self.lcs['x']
@@ -258,7 +387,7 @@ class LCs:
             for _ in range(max_refine_iter - 1):
                 x2, y2, z2 = refine_pos(xarr[ids], yarr[ids], zarr[ids])
                 ids2 = kd.query_ball_point([x2, y2, z2], sr0)
-                if len(ids2) == len(ids) and np.all(np.in1d(ids2, ids)):
+                if set(ids2) == set(ids):
                     x1, y1, z1 = x2, y2, z2
                     break
                 ids = ids2
@@ -277,20 +406,25 @@ class LCs:
                 if analyze is not None and callable(analyze):
                     ares = analyze(self, ids)
 
-                    for _, __ in ares.items():
-                        if _ not in self.lcs:
-                            self.lcs[_] = []
-                        self.lcs[_].append(__)
+                    if ares:
+                        for _, __ in ares.items():
+                            if _ not in self.lcs:
+                                self.lcs[_] = []
+                            self.lcs[_].append(__)
 
         for i in range(len(vmask)):
             if not vmask[i]:
                 process_seed(i)
 
-            if i % N == 0 and verbose == True:
-                sys.stdout.write("\r %d points - %d lcs" % (i, len(self.lcs['x'])))
-                sys.stdout.flush()
+            if i % N == 0:
+                if verbose is True:
+                    # Interactive in-place progress for plain print mode
+                    sys.stdout.write("\r %d points - %d lcs" % (i, len(self.lcs['x'])))
+                    sys.stdout.flush()
+                elif callable(verbose):
+                    log("%d points - %d lcs" % (i, len(self.lcs['x'])))
 
-        if verbose == True:
+        if verbose is True:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
