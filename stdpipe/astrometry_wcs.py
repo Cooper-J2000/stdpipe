@@ -1,25 +1,46 @@
+from __future__ import annotations
+
 import numpy as np
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, SkyOffsetFrame
 import astropy.units as u
 
 
-def _sky_residuals_arcsec(wcs: WCS, xy: np.ndarray, sky: SkyCoord, center: SkyCoord) -> np.ndarray:
+def _sky_residuals_arcsec(
+    wcs: WCS, xy: np.ndarray, frame, off: SkyOffsetFrame, sky_off: SkyCoord, coslat: np.ndarray
+) -> np.ndarray:
     """
-    Residuals in tangent-plane arcsec using a SkyOffsetFrame around `center`.
+    Residuals in offset-frame arcsec around the field center.
+
+    The reference positions are precomputed in the offset frame (`sky_off`,
+    with `coslat` = cos of their offset latitudes) since they do not change
+    during the fit.  Longitude offsets are scaled by cos(lat) so that both
+    components are proper angular distances even far from the center.
+
     Returns concatenated [d_lon_arcsec, d_lat_arcsec] per point.
     """
-    ra_dec = wcs.all_pix2world(xy[:, 0], xy[:, 1], 0)
-    model = SkyCoord(ra=ra_dec[0] * u.deg, dec=ra_dec[1] * u.deg, frame=sky.frame)
-
-    off = SkyOffsetFrame(origin=center)
-    sky_off = sky.transform_to(off)
+    ra, dec = wcs.all_pix2world(xy[:, 0], xy[:, 1], 0)
+    model = SkyCoord(ra * u.deg, dec * u.deg, frame=frame)
     model_off = model.transform_to(off)
 
-    # Use small-angle offsets on the tangent plane (arcsec)
-    dlon = (model_off.lon - sky_off.lon).to_value(u.arcsec)
+    dlon = (model_off.lon - sky_off.lon).to_value(u.arcsec) * coslat
     dlat = (model_off.lat - sky_off.lat).to_value(u.arcsec)
     return np.concatenate([dlon, dlat])
+
+
+def _spherical_mean(sky: SkyCoord) -> SkyCoord:
+    """Direction of the mean unit vector of *sky* (robust to the lon=0/360 wrap)."""
+    xyz = sky.cartesian.xyz.value
+    mean = np.mean(np.atleast_2d(xyz), axis=1)
+    norm = np.linalg.norm(mean)
+    if not np.isfinite(norm) or norm <= 0:
+        raise ValueError("Cannot determine field center from reference positions")
+    mean = mean / norm
+    return SkyCoord(
+        np.degrees(np.arctan2(mean[1], mean[0])) * u.deg,
+        np.degrees(np.arcsin(np.clip(mean[2], -1.0, 1.0))) * u.deg,
+        frame=sky.frame,
+    )
 
 
 def _pack_params(w: WCS, pv_deg: int) -> np.ndarray:
@@ -107,6 +128,7 @@ def fit_zpn_wcs_from_points(
     robust_loss: str = "soft_l1",
     f_scale_arcsec: float = 2.0,
     max_nfev: int = 200,
+    verbose: bool = False,
 ):
     """
     Fit a ZPN WCS by optimizing WCS parameters against matched (x,y) <-> (ra,dec).
@@ -130,11 +152,14 @@ def fit_zpn_wcs_from_points(
         Robust loss scale in arcsec.
     max_nfev : int
         Optimization iterations (SciPy).
+    verbose : bool or callable
+        Whether to show verbose messages during the run of the function or not.
+        May also be a print-like function.
 
     Returns
     -------
     wcs_best : astropy.wcs.WCS
-    result : scipy OptimizeResult (or None if SciPy not available)
+    result : scipy OptimizeResult (or None if nothing was fitted)
 
     Notes
     -----
@@ -143,16 +168,52 @@ def fit_zpn_wcs_from_points(
     parameters (including PV) with conservative bounds to prevent
     invalid projections.
     """
+    try:
+        from scipy.optimize import least_squares
+    except ImportError as e:
+        raise RuntimeError(
+            "fit_zpn_wcs_from_points requires SciPy (scipy.optimize.least_squares)"
+        ) from e
+
+    # Simple wrapper around print for logging in verbose mode only
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
+
     xy = np.asarray(xy, dtype=float)
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError("xy must be (N,2)")
     if len(sky) != xy.shape[0]:
         raise ValueError("sky and xy must have the same length")
 
-    # Choose a stable center for residuals (near the middle of your matched set)
-    center = SkyCoord(
-        ra=np.median(sky.ra).to(u.deg), dec=np.median(sky.dec).to(u.deg), frame=sky.frame
-    )
+    # Parameter packing assumes the CD convention; fold PC/CDELT into CD if needed
+    if not wcs_init.wcs.has_cd():
+        cd = np.array(wcs_init.pixel_scale_matrix, dtype=float)
+        wcs_init = wcs_init.deepcopy()
+        wcs_init.wcs.cdelt = np.ones(2)
+        if wcs_init.wcs.has_pc():
+            wcs_init.wcs.__delattr__("pc")
+        wcs_init.wcs.cd = cd
+
+    if fit_pv:
+        pv1_init = 0.0
+        for i, m, val in wcs_init.wcs.get_pv():
+            if i == 2 and m == 1:
+                pv1_init = float(val)
+        if not np.isfinite(pv1_init) or pv1_init == 0:
+            raise ValueError(
+                "Initial ZPN WCS has PV2_1 = 0 or undefined; the linear radial term "
+                "must be non-zero to fit PV coefficients "
+                "(e.g. initialize the WCS with tan_wcs_to_zpn())"
+            )
+
+    # Stable center for residual evaluation: spherical mean of the reference
+    # positions (robust to the lon=0/360 wrap, unlike a coordinate-wise median)
+    center = _spherical_mean(sky)
+
+    # The offset frame and reference positions in it are constant during the
+    # fit, so compute them once here rather than per residual evaluation
+    off = SkyOffsetFrame(origin=center)
+    sky_off = sky.transform_to(off)
+    coslat = np.cos(sky_off.lat.to_value(u.rad))
 
     def _estimate_theta_max_deg(w: WCS) -> float | None:
         if w.pixel_shape is None:
@@ -192,9 +253,9 @@ def fit_zpn_wcs_from_points(
                 and np.all(np.isfinite(ra_k))
                 and np.all(np.isfinite(dec_k))
             ):
-                center = SkyCoord(ra_c * u.deg, dec_c * u.deg, frame="icrs")
+                center_c = SkyCoord(ra_c * u.deg, dec_c * u.deg, frame="icrs")
                 sky_k = SkyCoord(ra_k * u.deg, dec_k * u.deg, frame="icrs")
-                theta = float(np.max(center.separation(sky_k).to_value(u.deg)))
+                theta = float(np.max(center_c.separation(sky_k).to_value(u.deg)))
                 return max(theta, 0.01)
         except Exception:
             pass
@@ -202,56 +263,46 @@ def fit_zpn_wcs_from_points(
         return None
 
     def _make_bounds(p0: np.ndarray, mask: np.ndarray, base: WCS, allow_pv: bool) -> tuple:
+        # Build bounds over the full parameter vector, then slice by mask.
         # CRPIX/CRVAL/CD unbounded by default
-        free0 = p0[mask]
-        lb = np.full_like(free0, -np.inf, dtype=float)
-        ub = np.full_like(free0, +np.inf, dtype=float)
+        lb = np.full_like(p0, -np.inf, dtype=float)
+        ub = np.full_like(p0, +np.inf, dtype=float)
 
-        if not allow_pv or pv_deg < 1:
-            return lb, ub
+        if allow_pv and pv_deg >= 1:
+            # PV bounds: keep solution in a physically plausible neighborhood
+            pv0 = float(p0[8 + 0])
+            pv1 = float(p0[8 + 1])  # non-zero, guaranteed by the check above
 
-        # PV bounds: keep solution in a physically plausible neighborhood
-        pv0 = float(p0[8 + 0])
-        pv1 = float(p0[8 + 1]) if pv_deg >= 1 else 1.0
-        if not np.isfinite(pv1) or pv1 == 0:
-            pv1 = 1.0
+            theta_max_deg = _estimate_theta_max_deg(base)
+            pv1_abs = abs(pv1)
 
-        theta_max_deg = _estimate_theta_max_deg(base)
-        pv1_abs = abs(pv1) if np.isfinite(pv1) else 1.0
-
-        # PV2_0 ~ 0 (allow small drift; keep init inside bounds)
-        full_idx = 8 + 0
-        if mask[full_idx]:
-            free_idx = np.flatnonzero(mask).tolist().index(full_idx)
+            # PV2_0 ~ 0 (allow small drift; keep init inside bounds)
             pv0_abs = max(1e-3, abs(pv0) * 2.0)
-            lb[free_idx] = pv0 - pv0_abs
-            ub[free_idx] = pv0 + pv0_abs
+            lb[8 + 0] = pv0 - pv0_abs
+            ub[8 + 0] = pv0 + pv0_abs
 
-        # PV2_1 (linear): allow moderate range, keep positive
-        full_idx = 8 + 1
-        if mask[full_idx]:
-            free_idx = np.flatnonzero(mask).tolist().index(full_idx)
-            lb[free_idx] = max(0.1, pv1 * 0.2)
-            ub[free_idx] = pv1 * 5.0
-
-        # Higher-order PV terms: limit contribution at field edge
-        pv_frac = 0.3  # allow ~30% of linear term at the edge
-        for m in range(2, pv_deg + 1):
-            full_idx = 8 + m
-            if not mask[full_idx]:
-                continue
-            pv_m = float(p0[full_idx])
-            if theta_max_deg is not None and np.isfinite(theta_max_deg) and theta_max_deg > 0:
-                abs_bound = pv_frac * pv1_abs / (theta_max_deg ** (m - 1))
+            # PV2_1 (linear): allow moderate range, keep the initial sign
+            lo = min(max(0.1, pv1_abs * 0.2), pv1_abs)
+            hi = pv1_abs * 5.0
+            if pv1 > 0:
+                lb[8 + 1], ub[8 + 1] = lo, hi
             else:
-                abs_bound = max(abs(pv_m) * 5.0, 1e-6)
-            # Keep initial value inside bounds
-            abs_bound = max(abs_bound, abs(pv_m) * 2.0)
-            free_idx = np.flatnonzero(mask).tolist().index(full_idx)
-            lb[free_idx] = pv_m - abs_bound
-            ub[free_idx] = pv_m + abs_bound
+                lb[8 + 1], ub[8 + 1] = -hi, -lo
 
-        return lb, ub
+            # Higher-order PV terms: limit contribution at field edge
+            pv_frac = 0.3  # allow ~30% of linear term at the edge
+            for m in range(2, pv_deg + 1):
+                pv_m = float(p0[8 + m])
+                if theta_max_deg is not None and np.isfinite(theta_max_deg) and theta_max_deg > 0:
+                    abs_bound = pv_frac * pv1_abs / (theta_max_deg ** (m - 1))
+                else:
+                    abs_bound = max(abs(pv_m) * 5.0, 1e-6)
+                # Keep initial value inside bounds
+                abs_bound = max(abs_bound, abs(pv_m) * 2.0)
+                lb[8 + m] = pv_m - abs_bound
+                ub[8 + m] = pv_m + abs_bound
+
+        return lb[mask], ub[mask]
 
     def _fit_with_mask(base: WCS, allow_pv: bool):
         p0 = _pack_params(base, pv_deg=pv_deg)
@@ -285,7 +336,13 @@ def fit_zpn_wcs_from_points(
 
         def fun(free: np.ndarray) -> np.ndarray:
             w = make_wcs_from_free(free)
-            res = _sky_residuals_arcsec(w, xy, sky, center)
+            try:
+                res = _sky_residuals_arcsec(w, xy, sky.frame, off, sky_off, coslat)
+            except ValueError:
+                # wcslib may reject some in-bounds PV combinations as an
+                # invalid projection; report a very poor fit instead of
+                # crashing so the optimizer backs off
+                return np.full(2 * xy.shape[0], 1e6)
             if not np.all(np.isfinite(res)):
                 res = np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
             return res
@@ -304,14 +361,15 @@ def fit_zpn_wcs_from_points(
         w_best = make_wcs_from_free(res.x)
         return w_best, res
 
-    # Try SciPy; if unavailable, error with a clear message.
-    try:
-        from scipy.optimize import least_squares
-    except Exception as e:
-        raise RuntimeError(
-            "This fitter needs SciPy (scipy.optimize.least_squares). "
-            "Install scipy or tell me and I’ll provide a pure-numpy Gauss-Newton fallback."
-        ) from e
+    def _log_residuals(label: str, res) -> None:
+        if res is None:
+            return
+        n = xy.shape[0]
+        r = np.hypot(res.fun[:n], res.fun[n:])
+        log(
+            f"ZPN fit {label}: median residual {np.median(r):.3g} arcsec "
+            f"over {n} points, {res.nfev} function evaluations"
+        )
 
     # Two-stage fit: first solve CRPIX/CRVAL/CD with PV fixed,
     # then allow PV with conservative bounds.
@@ -320,8 +378,10 @@ def fit_zpn_wcs_from_points(
 
     if fit_pv and (fit_crpix or fit_crval or fit_cd):
         w_curr, res_last = _fit_with_mask(w_curr, allow_pv=False)
+        _log_residuals("linear stage (PV fixed)", res_last)
 
     w_curr, res_last = _fit_with_mask(w_curr, allow_pv=fit_pv)
+    _log_residuals("final stage", res_last)
 
     # Normalize so PV2_1 = 1 (breaks the CD/PV degeneracy)
     if fit_pv:
@@ -340,6 +400,7 @@ def _fit_zpn_sip(
     robust_loss="soft_l1",
     f_scale_arcsec=2.0,
     max_nfev=200,
+    verbose=False,
 ):
     """Add SIP distortion corrections on top of a ZPN WCS.
 
@@ -362,9 +423,12 @@ def _fit_zpn_sip(
     pv_deg : int
         ZPN PV polynomial degree for re-fitting.
     n_iter : int
-        Number of PV+SIP alternation iterations.
+        Maximal number of PV+SIP alternation iterations.
     robust_loss, f_scale_arcsec, max_nfev :
         Passed to ``fit_zpn_wcs_from_points`` for PV re-fitting.
+    verbose : bool or callable
+        Whether to show verbose messages during the run of the function or not.
+        May also be a print-like function.
 
     Returns
     -------
@@ -372,6 +436,9 @@ def _fit_zpn_sip(
         ZPN-SIP WCS with both PV and SIP coefficients.
     """
     from astropy.wcs.wcs import Sip
+
+    # Simple wrapper around print for logging in verbose mode only
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
     xy = np.asarray(xy, dtype=float)
     w = wcs_zpn.deepcopy()
@@ -383,7 +450,7 @@ def _fit_zpn_sip(
             pq.append((total - q, q))
 
     crpix = np.array(w.wcs.crpix, dtype=float)  # 1-based
-    prev_med_dist = np.inf
+    prev_q90 = np.inf
 
     for iteration in range(n_iter):
         # Strip SIP to get the base ZPN-only WCS
@@ -392,8 +459,10 @@ def _fit_zpn_sip(
         if '-SIP' in w_nosip.wcs.ctype[0]:
             w_nosip.wcs.ctype = [c.replace('-SIP', '') for c in w_nosip.wcs.ctype]
 
-        # Undistorted pixel coords: where ZPN projection places catalog stars
-        x_cat, y_cat = w_nosip.all_world2pix(sky.ra.deg, sky.dec.deg, 0)
+        # Undistorted pixel coords: where ZPN projection places catalog stars.
+        # quiet=True prevents NoConvergence for points near the projection edge;
+        # non-finite results are excluded below.
+        x_cat, y_cat = w_nosip.all_world2pix(sky.ra.deg, sky.dec.deg, 0, quiet=True)
         u_cat = x_cat - (crpix[0] - 1)
         v_cat = y_cat - (crpix[1] - 1)
 
@@ -409,12 +478,16 @@ def _fit_zpn_sip(
 
         # Filter outliers (use median absolute deviation)
         dist = np.sqrt(du**2 + dv**2)
-        med_dist = np.median(dist)
-        mad = np.median(np.abs(dist - med_dist))
-        good = dist < med_dist + 5 * max(mad, 0.5)  # generous 5-sigma clip
+        finite = np.isfinite(dist)
+        if np.sum(finite) < len(pq) + 5:
+            log(f"SIP iteration {iteration}: too few finite points ({np.sum(finite)}), stopping")
+            break
+        med_dist = np.median(dist[finite])
+        mad = np.median(np.abs(dist[finite] - med_dist))
+        good = finite & (dist < med_dist + 5 * max(mad, 0.5))  # generous 5-sigma clip
 
         if np.sum(good) < len(pq) + 5:
-            # Not enough points for SIP fitting
+            log(f"SIP iteration {iteration}: too few points after clipping ({np.sum(good)}), stopping")
             break
 
         # SIP basis uses undistorted (raw pixel) coordinates
@@ -462,11 +535,13 @@ def _fit_zpn_sip(
         # Use 90th percentile (sensitive to outer-field + center) rather
         # than median which converges before the center is corrected.
         curr_q90 = np.percentile(dist[good], 90)
-        if iteration > 4 and prev_med_dist < np.inf:
-            rel_change = abs(curr_q90 - prev_med_dist) / max(prev_med_dist, 1e-6)
+        log(f"SIP iteration {iteration}: q90 distortion {curr_q90:.4g} pix over {np.sum(good)} points")
+        if iteration >= 2 and prev_q90 < np.inf:
+            rel_change = abs(curr_q90 - prev_q90) / max(prev_q90, 1e-6)
             if rel_change < 0.005:
+                log(f"SIP converged after {iteration + 1} iterations")
                 break
-        prev_med_dist = curr_q90
+        prev_q90 = curr_q90
 
         # Re-fit PV with SIP now applied (last iteration skip PV refit)
         if iteration < n_iter - 1:
@@ -478,6 +553,7 @@ def _fit_zpn_sip(
                 robust_loss=robust_loss,
                 f_scale_arcsec=f_scale_arcsec,
                 max_nfev=max_nfev,
+                verbose=verbose,
             )
             crpix = np.array(w.wcs.crpix, dtype=float)
 
@@ -486,10 +562,9 @@ def _fit_zpn_sip(
 
 def tan_wcs_to_zpn(
     w_tan: WCS,
-    pv_deg: int = 7,
+    pv_deg: int = 5,
     n_samples: int = 256,
     theta_max_deg: float | None = None,
-    drop_sip: bool = True,
 ) -> WCS:
     """
     Convert a celestial TAN WCS into a ZPN WCS with PV2_m initialized to approximate TAN.
@@ -504,6 +579,10 @@ def tan_wcs_to_zpn(
     We set PV2_0 = 0 and fit PV2_1..PV2_M to approximate the TAN law
     over theta in [0, theta_max_deg].
 
+    SIP and other pixel-space distortions of the input WCS are dropped
+    (they are not representable in the radial ZPN model); refit them on
+    top of the result if needed, e.g. with :func:`_fit_zpn_sip`.
+
     Parameters
     ----------
     w_tan : astropy.wcs.WCS
@@ -516,71 +595,19 @@ def tan_wcs_to_zpn(
     theta_max_deg : float or None
         Max angular radius (deg) over which to match TAN. If None,
         estimated from image footprint corners using pixel_shape.
-    drop_sip : bool
-        If True, removes SIP distortions from the returned WCS.
 
     Returns
     -------
     w_zpn : astropy.wcs.WCS
         A ZPN WCS with same CRVAL/CRPIX/CD and PV2_m initialized.
     """
-    # Build a clean WCS with CD only (no PC) to avoid PC/CDELT overriding CD.
-    w = WCS(naxis=2)
-
-    # Compute CD from the input WCS
-    if w_tan.wcs.has_cd():
-        cd = np.array(w_tan.wcs.cd, dtype=float)
-    elif w_tan.wcs.has_pc():
-        pc = np.array(w_tan.wcs.pc, dtype=float)
-        cdelt = np.array(w_tan.wcs.cdelt, dtype=float)
-        cd = pc * cdelt[None, :]
-    else:
-        cdelt = np.array(w_tan.wcs.cdelt, dtype=float)
-        cd = np.diag(cdelt)
-
-    w.wcs.crpix = np.array(w_tan.wcs.crpix, dtype=float)
-    w.wcs.crval = np.array(w_tan.wcs.crval, dtype=float)
-    w.wcs.cd = cd
-
-    # Switch projection to ZPN (keep axis names)
     ctype1, ctype2 = w_tan.wcs.ctype
     if len(ctype1) < 8 or len(ctype2) < 8:
         raise ValueError("Expected CTYPE like 'RA---TAN'/'DEC--TAN'.")
-    w.wcs.ctype = (ctype1[:5] + "ZPN", ctype2[:5] + "ZPN")
 
-    # Copy metadata / frame info when available
-    try:
-        w.wcs.cunit = w_tan.wcs.cunit
-    except Exception:
-        pass
-    try:
-        w.wcs.radesys = w_tan.wcs.radesys
-    except Exception:
-        pass
-    try:
-        w.wcs.equinox = w_tan.wcs.equinox
-    except Exception:
-        pass
-    try:
-        if np.isfinite(w_tan.wcs.lonpole):
-            w.wcs.lonpole = float(w_tan.wcs.lonpole)
-    except Exception:
-        pass
-    try:
-        if np.isfinite(w_tan.wcs.latpole):
-            w.wcs.latpole = float(w_tan.wcs.latpole)
-    except Exception:
-        pass
-    if w_tan.pixel_shape is not None:
-        w.pixel_shape = w_tan.pixel_shape
-
-    # SIP/distortion is not standard for ZPN; keep behavior explicit
-    if drop_sip:
-        w.sip = None
-        w.cpdis1 = None
-        w.cpdis2 = None
-        w.det2im1 = None
-        w.det2im2 = None
+    # Clean linear WCS (CRPIX/CRVAL/CD + metadata) with ZPN projection;
+    # strips SIP and PV parameters
+    w = _wcs_to_linear(w_tan, "ZPN")
 
     # Estimate theta_max from footprint if not provided
     if theta_max_deg is None:
@@ -625,8 +652,8 @@ def tan_wcs_to_zpn(
     # r ≈ sum c[m-1] * theta^m
     A = np.vstack([theta**m for m in range(1, pv_deg + 1)]).T
 
-    # Mild weighting: emphasize central region (helps stability)
-    # (You can tune this; it’s just for initialization.)
+    # Mild weighting emphasizing the central region: stabilizes the fit
+    # against the steep TAN growth near theta_max; only used for initialization
     wgt = 1.0 / (1.0 + (theta / (0.6 * theta_max_deg)) ** 2)
     Aw = A * wgt[:, None]
     bw = r_tan_deg * wgt
@@ -661,9 +688,11 @@ def convert_wcs_projection(
     -------
     WCS
         New WCS with the target projection.  For ZPN the PV coefficients
-        are initialised to approximate the input projection's radial law.
-        For other projections CRPIX/CRVAL/CD are copied and CTYPE is
-        replaced.
+        are initialised from the TAN radial law — an exact match for TAN
+        input, and a generic starting point (meant to be refined by a
+        subsequent fit) for other input projections.  For other targets
+        CRPIX/CRVAL/CD are copied and CTYPE is replaced, so the mapping
+        away from the reference point changes; refit afterwards.
     """
     target = target_projection.upper().strip()
 
@@ -704,16 +733,9 @@ def _wcs_to_linear(wcs_input: WCS, proj_code: str) -> WCS:
     """
     w = WCS(naxis=2)
 
-    # CD matrix
-    if wcs_input.wcs.has_cd():
-        cd = np.array(wcs_input.wcs.cd, dtype=float)
-    elif wcs_input.wcs.has_pc():
-        pc = np.array(wcs_input.wcs.pc, dtype=float)
-        cdelt = np.array(wcs_input.wcs.cdelt, dtype=float)
-        cd = pc * cdelt[None, :]
-    else:
-        cdelt = np.array(wcs_input.wcs.cdelt, dtype=float)
-        cd = np.diag(cdelt)
+    # CD matrix; pixel_scale_matrix correctly folds CDELT_i * PC_ij
+    # (row scaling) when the input uses the PC/CDELT convention
+    cd = np.array(wcs_input.pixel_scale_matrix, dtype=float)
 
     w.wcs.crpix = np.array(wcs_input.wcs.crpix, dtype=float)
     w.wcs.crval = np.array(wcs_input.wcs.crval, dtype=float)
@@ -754,6 +776,7 @@ def _fit_tan_sip_robust(
     sip_degree=2,
     robust_loss="soft_l1",
     f_scale=None,
+    verbose=False,
 ):
     """Fit TAN+SIP WCS with robust loss function.
 
@@ -781,6 +804,9 @@ def _fit_tan_sip_robust(
         Soft margin for robust loss in the SIP stage.  If None
         (default), estimated adaptively from the L2 SIP residuals.
         The linear stage always uses a data-driven scale.
+    verbose : bool or callable
+        Whether to show verbose messages during the run of the function or not.
+        May also be a print-like function.
 
     Returns
     -------
@@ -788,12 +814,20 @@ def _fit_tan_sip_robust(
     """
     from scipy.optimize import least_squares
 
-    from astropy.wcs.utils import (
-        _linear_wcs_fit,
-        _sip_fit,
-        celestial_frame_to_wcs,
-    )
+    from astropy.wcs.utils import celestial_frame_to_wcs
     from astropy.wcs.wcs import Sip
+
+    try:
+        # Private astropy helpers (stable since astropy 3.x, but not public API)
+        from astropy.wcs.utils import _linear_wcs_fit, _sip_fit
+    except ImportError as e:
+        raise RuntimeError(
+            "astropy internals (_linear_wcs_fit/_sip_fit) are not available in "
+            "this astropy version; _fit_tan_sip_robust needs updating"
+        ) from e
+
+    # Simple wrapper around print for logging in verbose mode only
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
     xp, yp = xy
     try:
@@ -813,7 +847,8 @@ def _fit_tan_sip_robust(
         wcs.sip = None
 
     if wcs.wcs.has_pc():
-        wcs.wcs.cd = wcs.wcs.pc * wcs.wcs.cdelt
+        # pixel_scale_matrix folds CDELT_i * PC_ij with correct row scaling
+        wcs.wcs.cd = wcs.pixel_scale_matrix
         wcs.wcs.cdelt = (1.0, 1.0)
         wcs.wcs.__delattr__("pc")
 
@@ -869,6 +904,10 @@ def _fit_tan_sip_robust(
     )
     wcs.wcs.crpix = np.array(fit.x[4:6])
     wcs.wcs.cd = np.array(fit.x[0:4].reshape((2, 2)))
+    log(
+        f"TAN-SIP linear stage: median residual "
+        f"{np.median(np.abs(fit.fun)) * 3600:.3g} arcsec"
+    )
 
     # --- Stage 2: joint CD + CRPIX + SIP ---
     if "-SIP" not in wcs.wcs.ctype[0]:
@@ -949,6 +988,10 @@ def _fit_tan_sip_robust(
         method="trf",
         x_scale=sip_x_scale,
     )
+    log(
+        f"TAN-SIP robust stage: median residual "
+        f"{np.median(np.abs(fit.fun)) * 3600:.3g} arcsec, f_scale {sip_f_scale * 3600:.3g} arcsec"
+    )
 
     coef_fit = (
         list(fit.x[6 : 6 + len(coef_names)]),
@@ -983,6 +1026,7 @@ def fit_wcs_from_points(
     projection=None,
     sip_degree=None,
     pv_deg=5,
+    verbose=False,
 ):
     """Drop-in wrapper around :func:`astropy.wcs.utils.fit_wcs_from_points`
     that also handles **ZPN** projection (which astropy does not natively fit)
@@ -995,16 +1039,21 @@ def fit_wcs_from_points(
     world_coords : `~astropy.coordinates.SkyCoord`
         Reference sky positions.
     proj_point : str, optional
-        Passed through to astropy for non-ZPN projections.
+        Passed through to astropy for non-ZPN projections.  Ignored for ZPN,
+        where the projection center comes from the template WCS.
     projection : `~astropy.wcs.WCS` or other, optional
         Projection template.  If this is a WCS with ``RA---ZPN / DEC--ZPN``
         CTYPEs, the ZPN fitter is used instead of astropy's.
     sip_degree : int or None, optional
         SIP polynomial degree.  For TAN projections, controls SIP distortion
         order.  For ZPN projections, if > 0, SIP corrections are fitted on
-        top of ZPN PV parameters to capture non-radial distortions.
+        top of ZPN PV parameters to capture non-radial distortions.  For
+        other projections it is ignored (SIP is not standard there).
     pv_deg : int, optional
         ZPN PV polynomial degree (``PV2_0 … PV2_pv_deg``).  Default 5.
+    verbose : bool or callable, optional
+        Whether to show verbose messages during the run of the function or not.
+        May also be a print-like function.
 
     Returns
     -------
@@ -1012,6 +1061,9 @@ def fit_wcs_from_points(
         Fitted WCS (same return type as the astropy function).
     """
     from astropy.wcs.utils import fit_wcs_from_points as _astropy_fit
+
+    # Simple wrapper around print for logging in verbose mode only
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
     # Detect ZPN projection
     is_zpn = False
@@ -1023,31 +1075,35 @@ def fit_wcs_from_points(
 
     if is_zpn:
         # Convert xy to (N, 2) array expected by fit_zpn_wcs_from_points
-        xy_arr = np.asarray(xy, dtype=float)
         if isinstance(xy, (list, tuple)) and len(xy) == 2:
             # (x_array, y_array) form
             xy_arr = np.column_stack(
                 [np.asarray(xy[0], dtype=float), np.asarray(xy[1], dtype=float)]
             )
-        elif xy_arr.ndim == 2 and xy_arr.shape[0] == 2 and xy_arr.shape[1] != 2:
-            # (2, N) -> (N, 2)
-            xy_arr = xy_arr.T
+        else:
+            xy_arr = np.asarray(xy, dtype=float)
+            if xy_arr.ndim == 2 and xy_arr.shape[0] == 2 and xy_arr.shape[1] != 2:
+                # (2, N) -> (N, 2)
+                xy_arr = xy_arr.T
 
         zpn_deg = int(pv_deg)
 
         # First fit ZPN PV parameters (radial distortion)
+        log(f"Fitting ZPN WCS with pv_deg={zpn_deg} using {len(xy_arr)} points")
         wcs_best, _result = fit_zpn_wcs_from_points(
-            xy_arr, world_coords, wcs_init=projection, pv_deg=zpn_deg
+            xy_arr, world_coords, wcs_init=projection, pv_deg=zpn_deg, verbose=verbose
         )
 
         # Then fit SIP corrections for non-radial distortions
         if sip_degree is not None and int(sip_degree) > 0:
+            log(f"Fitting SIP degree {int(sip_degree)} corrections on top of ZPN")
             wcs_best = _fit_zpn_sip(
                 wcs_best,
                 xy_arr,
                 world_coords,
                 sip_degree=int(sip_degree),
                 pv_deg=zpn_deg,
+                verbose=verbose,
             )
 
         return wcs_best
@@ -1063,14 +1119,20 @@ def fit_wcs_from_points(
             pass
 
     if effective_sip is not None and effective_sip > 0:
+        log(f"Fitting TAN-SIP WCS with sip_degree={int(effective_sip)}")
         return _fit_tan_sip_robust(
             xy,
             world_coords,
             proj_point=proj_point,
             projection=projection,
             sip_degree=int(effective_sip),
+            verbose=verbose,
         )
 
+    if effective_sip != sip_degree:
+        log("SIP is not supported for this projection, ignoring sip_degree")
+
+    log("Fitting WCS using astropy fit_wcs_from_points")
     return _astropy_fit(
         xy,
         world_coords,
