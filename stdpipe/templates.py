@@ -425,21 +425,41 @@ def point_in_ls(ra, dec):
 def _filter_cells_by_footprint(cell_ra, cell_dec, cell_radius, wcs, width, height):
     """Return boolean mask of cells that overlap the image footprint.
 
-    After the coarse spherical-match preselection, this projects each
-    candidate cell center into the image pixel grid and keeps only
-    those whose centre falls within ``cell_radius`` (in pixels) of the
-    image boundaries.
+    After the coarse spherical-match preselection, this keeps only the
+    cells whose centre lies within ``cell_radius`` (degrees) of the image
+    footprint.
+
+    The test is performed in the *forward* WCS direction: the image pixel
+    grid is projected onto the sky with :meth:`~astropy.wcs.WCS.all_pix2world`
+    and every cell centre is compared against those samples.  This avoids
+    inverting the WCS (``all_world2pix``), whose distortion de-projection may
+    fail to converge for points lying well outside the image - as happens for
+    high-order TPV/SIP solutions, where it previously raised
+    ``InvalidCoordinateError`` and aborted template retrieval.
     """
     from astropy.wcs.utils import proj_plane_pixel_scales
 
     pixscale = np.mean(proj_plane_pixel_scales(wcs))  # deg/pixel
-    margin = cell_radius / pixscale  # cell radius in pixels
 
-    # Project cell centres to pixel coordinates (may be outside image)
-    px, py = wcs.all_world2pix(cell_ra, cell_dec, 0, quiet=True)
+    # Sample the image on a grid fine enough that neighbouring samples stay
+    # well below one cell radius apart, so no overlapping cell is missed.
+    step = max(1.0, 0.5 * cell_radius / pixscale)  # pixels
+    nx = int(min(200, max(2, np.ceil(width / step) + 1)))
+    ny = int(min(200, max(2, np.ceil(height / step) + 1)))
+    xx, yy = np.meshgrid(np.linspace(0, width, nx), np.linspace(0, height, ny))
 
-    keep = (px > -margin) & (px < width + margin) & (py > -margin) & (py < height + margin)
-    return keep
+    # Forward projection only - never needs distortion inversion
+    sample_ra, sample_dec = wcs.all_pix2world(xx.ravel(), yy.ravel(), 0)
+    samples = SkyCoord(sample_ra, sample_dec, unit='deg')
+
+    cells = SkyCoord(
+        np.asarray(cell_ra, dtype=float), np.asarray(cell_dec, dtype=float), unit='deg'
+    )
+
+    # Angular distance from each cell centre to the nearest image sample
+    _, sep, _ = cells.match_to_catalog_sky(samples)
+
+    return sep.deg < cell_radius
 
 
 def find_skycells(

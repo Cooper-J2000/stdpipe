@@ -712,3 +712,23 @@ class TestFilterCellsByFootprint:
         assert keep[0]       # centre
         assert not keep[1]   # 0.1 deg away in Dec, far outside
         assert not keep[2]   # 5 deg away in RA
+
+    def test_uses_forward_projection_only(self):
+        """Filtering must never invert the WCS.
+
+        Regression guard: for high-order TPV/SIP solutions ``all_world2pix``
+        can fail to converge (``InvalidCoordinateError``) when projecting cell
+        centres that lie far outside the image, which used to abort template
+        retrieval.  The footprint test must therefore rely solely on the
+        forward ``all_pix2world`` direction.
+        """
+        wcs = _make_wcs()
+        with patch.object(
+            wcs, 'all_world2pix', side_effect=AssertionError('all_world2pix called')
+        ):
+            keep = templates._filter_cells_by_footprint(
+                np.array([180.0, 185.0]), np.array([45.0, 45.0]),
+                cell_radius=0.01, wcs=wcs, width=256, height=256,
+            )
+        assert keep[0]       # centre
+        assert not keep[1]   # far outside
