@@ -210,6 +210,57 @@ class TestEstimateFwhmFromObjects:
         result = photometry.estimate_fwhm_from_objects(obj)
         assert np.isnan(result)
 
+    @pytest.mark.unit
+    def test_elongated_population_adaptive_cut(self):
+        """Trailed image: when most stars are elongated, the fixed
+        ellipticity cut is replaced by an adaptive window so real stars
+        are kept and the FWHM estimate stays correct."""
+        rng = np.random.default_rng(42)
+        n = 100
+        # Trailed stars: a ~ 3, b ~ 1.5 -> ellipticity ~ 0.5
+        a = rng.normal(3.0, 0.2, n)
+        b = rng.normal(1.5, 0.1, n)
+        obj = Table(
+            {
+                'fwhm': rng.normal(7.0, 0.3, n),
+                'flux_radius': rng.normal(3.0, 0.15, n),  # eff. FWHM ~ 6
+                'a': a,
+                'b': b,
+                'flag': np.zeros(n, dtype=int),
+            }
+        )
+        result = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, max_ellipticity=0.3
+        )
+        assert abs(result - 6.0) < 0.5
+
+    @pytest.mark.unit
+    def test_elongated_population_rejects_round_contaminants(self):
+        """Trailed image with round noise spikes: with a fixed cut only the
+        contaminants would survive and drag the estimate to their (wrong)
+        size; the adaptive window keeps the trailed stars instead."""
+        rng = np.random.default_rng(42)
+        n_star, n_spike = 60, 20
+        obj = Table(
+            {
+                'flux_radius': np.concatenate(
+                    [rng.normal(3.5, 0.15, n_star), rng.normal(0.7, 0.05, n_spike)]
+                ),
+                'a': np.concatenate(
+                    [rng.normal(3.0, 0.2, n_star), np.full(n_spike, 1.0)]
+                ),
+                'b': np.concatenate(
+                    [rng.normal(1.5, 0.1, n_star), np.full(n_spike, 0.95)]
+                ),
+                'flag': np.zeros(n_star + n_spike, dtype=int),
+            }
+        )
+        result = photometry.estimate_fwhm_from_objects(
+            obj, snr_min=None, max_ellipticity=0.3
+        )
+        # Effective FWHM of the trailed stars is 2 * 3.5 = 7, spikes are 1.4
+        assert abs(result - 7.0) < 0.5
+
 
 class TestSpatialFWHM:
     """Test position-dependent FWHM estimation (spatial_order >= 1 / FWHMMap)."""

@@ -386,6 +386,14 @@ def _estimate_fwhm_with_guard(values, good, ab, fwhm_range, min_candidates, log,
         log("FWHM (%s): mode=%.2f" % (label, mode))
         return mode, True
 
+    if np.isfinite(weighted):
+        log(
+            "FWHM (%s): mode estimation failed (too few candidates), "
+            "falling back to ab-weighted median %.2f" % (label, weighted)
+        )
+    else:
+        log("FWHM (%s): estimation failed — no usable candidates" % label)
+
     return weighted, False
 
 
@@ -432,6 +440,12 @@ def estimate_fwhm_from_objects(
         Set to None to disable.
     max_ellipticity : float or None
         Maximum ellipticity ``1 - b/a``. Set to None to disable.
+        If the median ellipticity of the candidates passing the S/N and
+        flag cuts exceeds this value — the signature of an elongated
+        PSF (trailed image, strong aberrations) where a fixed roundness
+        cut would reject real stars and keep mostly round contaminants —
+        the cut is replaced by an adaptive window around the population
+        median ellipticity.
     use_flags : bool
         If True, reject objects with nonzero flags.
     fwhm_range : tuple of float
@@ -497,16 +511,6 @@ def estimate_fwhm_from_objects(
                 magerr = magerr[:, 0]
             good &= np.isfinite(magerr) & (magerr < 1.0 / snr_min) & (magerr > 0)
 
-    if max_ellipticity is not None:
-        if ab is not None:
-            with np.errstate(invalid='ignore'):
-                good &= (a > 0) & ((1.0 - b / a) < max_ellipticity)
-        elif 'A_IMAGE' in names and 'B_IMAGE' in names:
-            a_ = np.asarray(obj['A_IMAGE'], dtype=float)
-            b_ = np.asarray(obj['B_IMAGE'], dtype=float)
-            with np.errstate(invalid='ignore'):
-                good &= (a_ > 0) & ((1.0 - b_ / a_) < max_ellipticity)
-
     if use_flags:
         if 'flags' in names:
             good &= np.asarray(obj['flags']) == 0
@@ -514,6 +518,34 @@ def estimate_fwhm_from_objects(
             good &= np.asarray(obj['flag']) == 0
         elif 'FLAGS' in names:
             good &= np.asarray(obj['FLAGS']) == 0
+
+    # Ellipticity handling comes after the flag cut so that flagged
+    # detections (e.g. cosmics, which are often round) do not distort the
+    # median-ellipticity regime decision below.
+    if max_ellipticity is not None and a is not None:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            ell = np.where(a > 0, 1.0 - b / a, np.nan)
+        sel = good & np.isfinite(ell)
+        med_ell = np.median(ell[sel]) if np.any(sel) else np.nan
+
+        if np.isfinite(med_ell) and med_ell >= max_ellipticity:
+            # The typical quality candidate is more elongated than the
+            # roundness cut allows — elongated PSF (trailed image, strong
+            # aberrations). A fixed cut would reject real stars and keep
+            # mostly round contaminants (noise spikes, cosmics), so select
+            # a window around the population ellipticity instead.
+            mad_ell = 1.48 * np.median(np.abs(ell[sel] - med_ell))
+            margin = max(3.0 * mad_ell, 0.15)
+            lo, hi = med_ell - margin, min(med_ell + margin, 0.95)
+            log(
+                "Median candidate ellipticity %.2f exceeds max_ellipticity=%.2f "
+                "— sources appear elongated (trailed image?), keeping "
+                "ellipticity range %.2f..%.2f instead" % (med_ell, max_ellipticity, lo, hi)
+            )
+            good &= np.isfinite(ell) & (ell >= lo) & (ell <= hi)
+        else:
+            with np.errstate(invalid='ignore'):
+                good &= (a > 0) & (ell < max_ellipticity)
 
     # --- Per-object FWHM proxies, in priority order ---
     candidates = _fwhm_value_candidates(obj, names, a=a, b=b)
@@ -575,6 +607,7 @@ def estimate_fwhm_from_objects(
         if mode_ok or k == len(candidates) - 1:
             return estimate
 
+    log("FWHM estimation failed: no usable FWHM columns in the table")
     return np.nan
 
 
