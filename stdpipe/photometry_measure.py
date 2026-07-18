@@ -15,12 +15,18 @@ from photutils.utils import calc_total_error
 
 # Note: psf and photometry_psf modules imported lazily in functions to avoid circular dependency
 
-# Check if new SEP features are available (version 1.4+)
+# SEP-X is our rebranded SEP build carrying the optimal-extraction / PSF-fitting
+# extras. It is imported under the plain ``sep`` name to keep call sites unchanged;
+# a successful import is what gates the extra feature set.
 try:
+    import sep_x as sep
+
+    _HAS_SEP_OPTIMAL = True
+except ImportError:
+    # Upstream SEP still covers the basic aperture/background paths; the
+    # optimal-extraction / PSF-fitting extras are simply unavailable.
     import sep
 
-    _HAS_SEP_OPTIMAL = hasattr(sep, 'sum_circle_optimal') and hasattr(sep, 'stats_circann')
-except ImportError:
     _HAS_SEP_OPTIMAL = False
 
 
@@ -1334,8 +1340,6 @@ def _get_sep_psf(psf, fwhm, log):
     sep_psf : sep.PSF
         SEP PSF object.
     """
-    import sep
-
     if isinstance(psf, sep.PSF):
         log('Using provided sep.PSF model (FWHM=%.2f)' % psf.fwhm)
         return psf
@@ -1506,12 +1510,11 @@ def measure_objects_sep(
     - 0x1000: PSF fit returned non-zero quality flag, or PSF fit failed (NaN result)
     - 0x2000: Large centroid shift during PSF fit (>1 pixel)
     """
-    import sep
-
     if not _HAS_SEP_OPTIMAL:
         raise RuntimeError(
-            "measure_objects_sep() requires SEP version 1.4+ with sum_circle_optimal() and "
-            "stats_circann() functions. Please upgrade SEP or use measure_objects() instead."
+            "measure_objects_sep() requires SEP-X (the sep-x package) providing "
+            "sum_circle_optimal() and stats_circann(). Please install sep-x or use "
+            "measure_objects() instead."
         )
 
     # Simple wrapper around print for logging in verbose mode only
@@ -2034,7 +2037,6 @@ def measure_aperture_deblended(
     from astropy.table import Table
     from . import psf as psf_mod
     from . import smoothing
-    import sep
 
     log = (verbose if callable(verbose) else print) if verbose else (
         lambda *a, **k: None

@@ -17,7 +17,10 @@ from scipy import ndimage
 from scipy.optimize import least_squares
 import statsmodels.api as sm
 
-import sep
+try:
+    import sep_x as sep
+except ImportError:
+    import sep
 
 from . import astrometry
 from . import pipeline

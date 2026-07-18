@@ -16,7 +16,10 @@ from astropy.wcs import FITSFixedWarning
 # warnings.simplefilter(action='ignore', category=FITSFixedWarning)
 # warnings.simplefilter(action='ignore', category=FutureWarning)
 
-import sep
+try:
+    import sep_x as sep
+except ImportError:
+    import sep
 import photutils
 import photutils.background
 import photutils.aperture

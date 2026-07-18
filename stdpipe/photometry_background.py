@@ -938,7 +938,10 @@ def get_background(image, mask=None, method='sep', size=128, get_rms=False, **kw
     """
     if method == 'sep':
         # Fix #1: Lazy import
-        import sep
+        try:
+            import sep_x as sep
+        except ImportError:
+            import sep
 
         # Fix #5: Avoid unnecessary copy if already float64 and contiguous
         image = np.ascontiguousarray(image, dtype=np.double)

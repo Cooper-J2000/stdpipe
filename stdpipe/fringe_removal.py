@@ -432,7 +432,10 @@ def remove_fringes(
     >>> corrected = remove_fringes(image, mask=mask, scale=6)
     >>> corrected, fringes = remove_fringes(image, get_fringe_model=True)
     """
-    import sep
+    try:
+        import sep_x as sep
+    except ImportError:
+        import sep
 
     log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 

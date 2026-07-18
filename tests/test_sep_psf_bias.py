@@ -21,7 +21,7 @@ from stdpipe import psf as psf_module
 # Check SEP PSF availability
 _HAS_SEP_PSF = False
 try:
-    import sep
+    import sep_x as sep
 
     if hasattr(sep, 'PSF') and hasattr(sep, 'psf_fit'):
         _HAS_SEP_PSF = True

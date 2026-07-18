@@ -1632,7 +1632,7 @@ class TestPSFCentroidingAccuracy:
 
 _HAS_SEP_PSF = False
 try:
-    import sep
+    import sep_x as sep
 
     _HAS_SEP_PSF = hasattr(sep, 'psf_fit') and hasattr(sep, 'PSF')
 except ImportError:
@@ -2497,7 +2497,7 @@ class TestMeasureApertureDeblended:
     def test_isolated_source_matches_plain_aperture(self):
         """For a perfectly isolated source the deblending term cancels and
         the hybrid flux must equal the plain aperture sum."""
-        import sep
+        import sep_x as sep
         positions = [(60.0, 60.0)]
         total_flux = [1000.0]
         img, psf = _make_field(positions, total_flux, sigma=2.0)
@@ -2526,7 +2526,7 @@ class TestMeasureApertureDeblended:
     def test_neighbour_subtraction_recovers_target(self):
         """With a close pair, the hybrid flux for the target must be much
         closer to its own aperture-fraction than a plain aperture sum is."""
-        import sep
+        import sep_x as sep
         sigma = 2.0
         positions = [(80.0, 80.0), (84.0, 80.0)]
         total_flux = [1000.0, 800.0]

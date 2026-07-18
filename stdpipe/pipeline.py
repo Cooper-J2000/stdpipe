@@ -14,7 +14,10 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from astropy.table import Table
 
-import sep
+try:
+    import sep_x as sep
+except ImportError:
+    import sep
 import astroscrappy
 
 from . import photometry
