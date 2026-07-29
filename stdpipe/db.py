@@ -46,6 +46,19 @@ class DB:
         self.connstring = connstring
         self.readonly = readonly
 
+    def release(self):
+        """Close the connection, giving its server slot back to other clients.
+
+        A client that queries in bursts and then computes for a long time keeps a
+        backend - and one of the server's ``max_connections`` slots - occupied while
+        doing nothing. Calling this once the queries of a work item are done frees
+        the slot; :func:`query` reconnects transparently when the next query is
+        issued, so releasing is voluntary and safe at any point. Worth it only when
+        the idle stretch is long compared to the reconnection cost (a few ms).
+        """
+        if getattr(self, 'conn', None) is not None and not self.conn.closed:
+            self.conn.close()
+
     def query(self, string="", data=(), table=True, simplify=True, verbose=False):
         log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
 
@@ -53,7 +66,11 @@ class DB:
             log("DB connection is closed, re-connecting")
             self.connect(self.connstring, self.readonly)
 
-        cur = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        # A DictCursor builds a dict-like DictRow per row, which for a large
+        # catalogue query costs more than the query itself. The table=True path
+        # consumes the rows positionally, so a plain tuple cursor is enough there;
+        # the table=False path is kept on DictCursor for its by-name access.
+        cur = self.conn.cursor() if table else self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         if verbose:
             log('Sending DB query:', cur.mogrify(string, data))
