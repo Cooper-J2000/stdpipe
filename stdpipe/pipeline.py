@@ -171,9 +171,10 @@ def refine_astrometry(
         Matching radius in degrees.
     wcs : astropy.wcs.WCS, optional
         Initial WCS solution.
-    order : int, optional
+    order : int or str, optional
         Polynomial order for SIP or PV distortion solution. Default 0 for TAN;
-        2 is recommended for ``quadhash``.
+        2 is recommended for ``quadhash``. With ``method='scamp'`` it may also be
+        ``'auto'`` to select the degree from hold-out residuals.
     cat_col_mag : str, optional
         Catalogue column name for magnitude.
     cat_col_mag_err : str, optional

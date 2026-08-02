@@ -1250,6 +1250,11 @@ def refine_wcs_scamp(
     cat_col_mag_err='e_rmag',
     cat_mag_lim=99,
     sn=None,
+    pos_err_floor=0.25,
+    max_sigma=None,
+    min_matches_per_param=3,
+    auto_max_order=5,
+    auto_threshold=0.05,
     position_maxerr=None,
     posangle_maxerr=None,
     pixscale_maxerr=None,
@@ -1276,8 +1281,11 @@ def refine_wcs_scamp(
         FITS header containing the initial astrometric solution.
     sr : float, optional
         Matching radius in degrees. Controls SCAMP's ``CROSSID_RADIUS``.
-    order : int, optional
-        Polynomial order for PV distortion solution (1 or greater).
+    order : int or str, optional
+        Polynomial order for PV distortion solution (1 or greater), or ``'auto'``
+        to select it based on hold-out residuals, so that higher degrees are only
+        used when they actually improve the solution. Automatic selection needs a
+        local reference catalogue, and costs one extra SCAMP run per degree tried.
     cat_col_ra : str, optional
         Catalogue column name for Right Ascension.
     cat_col_dec : str, optional
@@ -1295,6 +1303,26 @@ def refine_wcs_scamp(
         upper limit; two values ``[min, max]`` define a range.
     sn : float or sequence of float, optional
         S/N threshold(s) for SCAMP (passed as ``SN_THRESHOLDS``).
+    pos_err_floor : float, optional
+        Floor for object positional errors, in pixels, added to them in quadrature.
+        Centroiding errors are formal photon noise ones and do not include
+        atmospheric and other systematic terms, so without such floor SCAMP
+        over-weights the brightest stars and reports meaninglessly large chi2.
+        Default is 0.25 pixels.
+    max_sigma : float, optional
+        Maximum acceptable rms of astrometric residuals w.r.t. the reference
+        catalogue, in arcsec. Solutions with larger residuals are rejected.
+        Default is a half of the matching radius ``sr``.
+    min_matches_per_param : float, optional
+        Minimal number of matched reference stars per free parameter of the
+        distortion polynomial. If the fit has less of them, it is repeated with
+        lower degree, down to ``order=1``, as such fits overfit the data and thus
+        have deceivingly small residuals. Default is 3.
+    auto_max_order : int, optional
+        Largest distortion degree to try when ``order='auto'``. Default is 5.
+    auto_threshold : float, optional
+        Minimal relative improvement of hold-out residuals for accepting the next
+        distortion degree when ``order='auto'``. Default is 0.05, i.e. 5 percent.
     position_maxerr : float, optional
         Maximum positional uncertainty of the initial WCS in arcminutes.
         Controls the search range for field center offset during pattern matching.
@@ -1384,18 +1412,14 @@ def refine_wcs_scamp(
     confname = os.path.join(workdir, 'empty.conf')
     utils.file_write(confname)
 
-    xmlname = os.path.join(workdir, 'scamp.xml')
-
     opts = {
         'c': confname,
         'VERBOSE_TYPE': 'QUIET',
         'SOLVE_PHOTOM': 'N',
         'CHECKPLOT_TYPE': 'NONE',
         'WRITE_XML': 'Y',
-        'XML_NAME': xmlname,
         'PROJECTION_TYPE': 'TPV',
         'CROSSID_RADIUS': sr * 3600,
-        'DISTORT_DEGREES': max(1, order),
         'STABILITY_TYPE': 'EXPOSURE',
         'SN_THRESHOLDS': [3.0, 30.0],
     }
@@ -1418,13 +1442,20 @@ def refine_wcs_scamp(
 
     opts.update(extra)
 
+    # Object positional errors from centroiding are formal photon noise ones, and
+    # thus routinely underestimate the actual scatter w.r.t. the reference catalogue,
+    # which also includes atmospheric and other systematic terms. Thus we add a floor
+    # to them in quadrature, so that SCAMP weighting and its chi2 stay sensible.
+    xerr = np.hypot(np.asarray(obj['xerr'], dtype=float), pos_err_floor)
+    yerr = np.hypot(np.asarray(obj['yerr'], dtype=float), pos_err_floor)
+
     # Minimal LDAC table with objects
     t_obj = Table(
         data={
             'XWIN_IMAGE': obj['x'] + 1,  # SCAMP uses 1-based coordinates
             'YWIN_IMAGE': obj['y'] + 1,
-            'ERRAWIN_IMAGE': obj['xerr'],
-            'ERRBWIN_IMAGE': obj['yerr'],
+            'ERRAWIN_IMAGE': xerr,
+            'ERRBWIN_IMAGE': yerr,
             'FLUX_AUTO': obj['flux'],
             'FLUXERR_AUTO': obj['fluxerr'],
             'MAG_AUTO': obj['mag'],
@@ -1436,10 +1467,47 @@ def refine_wcs_scamp(
     objname = os.path.join(workdir, 'objects.cat')
     table_to_ldac(t_obj, header, objname)
 
-    hdrname = os.path.join(workdir, 'objects.head')
-    opts['HEADER_NAME'] = hdrname
-    if os.path.exists(hdrname):
-        os.unlink(hdrname)
+    def write_catalogue(catalogue, catname):
+        """Store the reference catalogue as an LDAC file for SCAMP to use"""
+        t_cat = Table(
+            data={
+                'X_WORLD': catalogue[cat_col_ra],
+                'Y_WORLD': catalogue[cat_col_dec],
+                'ERRA_WORLD': utils.table_get(catalogue, cat_col_ra_err, 1 / 3600),
+                'ERRB_WORLD': utils.table_get(catalogue, cat_col_dec_err, 1 / 3600),
+                'MAG': utils.table_get(catalogue, cat_col_mag, 0),
+                'MAGERR': utils.table_get(catalogue, cat_col_mag_err, 0.01),
+                'OBSDATE': np.ones_like(catalogue[cat_col_ra]) * 2000.0,
+                'FLAGS': np.zeros_like(catalogue[cat_col_ra], dtype=int),
+            }
+        )
+
+        # Remove masked values
+        for _ in t_cat.colnames:
+            if np.ma.is_masked(t_cat[_]):
+                t_cat = t_cat[~t_cat[_].mask]
+
+        # Convert units of err columns to degrees, if any
+        for _ in ['ERRA_WORLD', 'ERRB_WORLD']:
+            if t_cat[_].unit and t_cat[_].unit != 'deg':
+                t_cat[_] = t_cat[_].to('deg')
+
+        # Limit the catalogue to given magnitude range
+        if cat_mag_lim is not None:
+            if hasattr(cat_mag_lim, '__len__') and len(cat_mag_lim) == 2:
+                # Two elements provided, treat them as lower and upper limits
+                t_cat = t_cat[
+                    (t_cat['MAG'] >= cat_mag_lim[0]) & (t_cat['MAG'] <= cat_mag_lim[1])
+                ]
+            else:
+                # One element provided, treat it as upper limit
+                t_cat = t_cat[t_cat['MAG'] <= cat_mag_lim]
+
+        table_to_ldac(t_cat, header, catname)
+
+        return catname
+
+    catname = None
 
     if cat:
         if type(cat) == str:
@@ -1448,135 +1516,243 @@ def refine_wcs_scamp(
             log('Using', cat, 'as a network catalogue')
         else:
             # Match with user-provided catalogue
-            t_cat = Table(
-                data={
-                    'X_WORLD': cat[cat_col_ra],
-                    'Y_WORLD': cat[cat_col_dec],
-                    'ERRA_WORLD': utils.table_get(cat, cat_col_ra_err, 1 / 3600),
-                    'ERRB_WORLD': utils.table_get(cat, cat_col_dec_err, 1 / 3600),
-                    'MAG': utils.table_get(cat, cat_col_mag, 0),
-                    'MAGERR': utils.table_get(cat, cat_col_mag_err, 0.01),
-                    'OBSDATE': np.ones_like(cat[cat_col_ra]) * 2000.0,
-                    'FLAGS': np.zeros_like(cat[cat_col_ra], dtype=int),
-                }
-            )
-
-            # Remove masked values
-            for _ in t_cat.colnames:
-                if np.ma.is_masked(t_cat[_]):
-                    t_cat = t_cat[~t_cat[_].mask]
-
-            # Convert units of err columns to degrees, if any
-            for _ in ['ERRA_WORLD', 'ERRB_WORLD']:
-                if t_cat[_].unit and t_cat[_].unit != 'deg':
-                    t_cat[_] = t_cat[_].to('deg')
-
-            # Limit the catalogue to given magnitude range
-            if cat_mag_lim is not None:
-                if hasattr(cat_mag_lim, '__len__') and len(cat_mag_lim) == 2:
-                    # Two elements provided, treat them as lower and upper limits
-                    t_cat = t_cat[
-                        (t_cat['MAG'] >= cat_mag_lim[0]) & (t_cat['MAG'] <= cat_mag_lim[1])
-                    ]
-                else:
-                    # One element provided, treat it as upper limit
-                    t_cat = t_cat[t_cat['MAG'] <= cat_mag_lim]
-
-            catname = os.path.join(workdir, 'catalogue.cat')
-            table_to_ldac(t_cat, header, catname)
-
+            catname = write_catalogue(cat, os.path.join(workdir, 'catalogue.cat'))
             opts['ASTREF_CATALOG'] = 'FILE'
             opts['ASTREFCAT_NAME'] = catname
             log('Using user-provided local catalogue')
     else:
         log('Using default settings for network catalogue')
 
-    # Build the command line
-    command = binname + ' ' + shlex.quote(objname) + ' ' + utils.format_astromatic_opts(opts)
-    if not verbose:
-        command += ' > /dev/null 2>/dev/null'
-    log('Will run SCAMP like that:')
-    log(command)
+    def run_scamp(order, catname=None, tag='', quiet=False):
+        """Run SCAMP for a given distortion degree, and return the solution as a
+        FITS header along with the number of matched reference stars and the rms
+        of their residuals in arcsec. Header is None if the run failed."""
+        # Simple wrapper around log for quiet mode only
+        rlog = (lambda *args, **kwargs: None) if quiet else log
 
-    # Run the command!
+        hdrname = os.path.join(workdir, 'objects%s.head' % tag)
+        xmlname = os.path.join(workdir, 'scamp%s.xml' % tag)
 
-    res = os.system(command)
+        for _ in [hdrname, xmlname]:
+            if os.path.exists(_):
+                os.unlink(_)
 
-    wcs = None
+        run_opts = dict(opts)
+        run_opts['DISTORT_DEGREES'] = max(1, order)
+        run_opts['HEADER_NAME'] = hdrname
+        run_opts['XML_NAME'] = xmlname
+        if catname is not None:
+            run_opts['ASTREFCAT_NAME'] = catname
 
-    if res == 0 and os.path.exists(hdrname) and os.path.exists(xmlname):
-        log('SCAMP run successfully')
+        # Build the command line
+        command = (
+            binname + ' ' + shlex.quote(objname) + ' ' + utils.format_astromatic_opts(run_opts)
+        )
+        if not verbose:
+            command += ' > /dev/null 2>/dev/null'
+        rlog('Will run SCAMP like that:')
+        rlog(command)
+
+        # Run the command!
+
+        res = os.system(command)
+
+        if res != 0 or not os.path.exists(hdrname) or not os.path.exists(xmlname):
+            rlog('Error', res, 'running SCAMP')
+            return None, 0, None
+
+        rlog('SCAMP run successfully')
 
         diag = Table.read(xmlname, table_id=0)[0]
 
         # Log detailed diagnostics from SCAMP XML
         n_matches = int(diag['NDeg_Reference'])
         reduced_chi2 = float(diag['Chi2_Reference'])
-        log('Reference matches: %d, reduced chi2: %.2f' % (n_matches, reduced_chi2))
+        rlog('Reference matches: %d, reduced chi2: %.2f' % (n_matches, reduced_chi2))
 
         # Log matching diagnostics if available (pattern matching was performed)
         for key in ['AS_Contrast', 'XY_Contrast', 'DPixelScale', 'DPosAngle', 'Shear']:
             if key in diag.colnames:
-                log('  %s: %s' % (key, diag[key]))
+                rlog('  %s: %s' % (key, diag[key]))
 
         # Log astrometric residuals if available
+        sigma = None
         for key in ['AstromOffset_Reference', 'AstromSigma_Reference']:
             if key in diag.colnames:
-                val = diag[key]
-                if hasattr(val, '__len__'):
-                    log('  %s: %s arcsec' % (key, ' '.join('%.3f' % v for v in val)))
-                else:
-                    log('  %s: %.3f arcsec' % (key, val))
+                val = np.atleast_1d(diag[key]).astype(float)
+                rlog('  %s: %s arcsec' % (key, ' '.join('%.3f' % v for v in val)))
+                if key == 'AstromSigma_Reference':
+                    # Combine per-axis residual rms values into a single number
+                    sigma = np.sqrt(np.mean(val**2))
 
-        # Validate the solution quality
-        # Chi2_Reference from SCAMP is already a reduced chi-squared
-        # (sum of chi2 divided by naxis * n_matches), so we check it directly
-        if n_matches < 3:
-            log('Too few matches (%d), fitting likely failed' % n_matches)
-        elif reduced_chi2 > 100:
-            log('Reduced chi2 too large (%.1f), fitting likely failed' % reduced_chi2)
+        with open(hdrname, 'r') as f:
+            h1 = fits.Header.fromstring(f.read().encode('ascii', 'ignore'), sep='\n')
+
+            # Sometimes SCAMP returns TAN type solution even despite PV keywords present
+            if h1['CTYPE1'] != 'RA---TPV' and 'PV1_0' in h1.keys():
+                rlog(
+                    'Got WCS solution with CTYPE1 =',
+                    h1['CTYPE1'],
+                    ' and PV keywords, fixing it',
+                )
+                h1['CTYPE1'] = 'RA---TPV'
+                h1['CTYPE2'] = 'DEC--TPV'
+            # .. while sometimes it does the opposite
+            elif h1['CTYPE1'] == 'RA---TPV' and 'PV1_0' not in h1.keys():
+                rlog(
+                    'Got WCS solution with CTYPE1 =',
+                    h1['CTYPE1'],
+                    ' and without PV keywords, fixing it',
+                )
+                h1['CTYPE1'] = 'RA---TAN'
+                h1['CTYPE2'] = 'DEC--TAN'
+                h1 = WCS(h1).to_header(relax=True)
+
+        return h1, n_matches, sigma
+
+    def min_matches_for(order):
+        """Minimal number of matched reference stars for a given distortion degree.
+        The fit should have noticeably more of them than it has free parameters,
+        else the residuals get small just due to overfitting. The number below is
+        the amount of polynomial terms of a given degree, for both axes."""
+        return int(np.ceil(min_matches_per_param * (max(1, order) + 1) * (max(1, order) + 2)))
+
+    def select_order():
+        """Choose the distortion degree by fitting one half of the reference
+        catalogue and measuring the residuals on the other, unused one. Unlike the
+        residuals of the fit itself, these get worse as soon as it starts to
+        overfit, so we may just pick the lowest degree that reaches the best of
+        them. We have to check all the degrees, as the improvement is not monotonic
+        - the distortion is often dominated by odd radial terms, so e.g. order 2
+        may add nothing at all over order 1 while order 3 improves a lot."""
+        if catname is None:
+            # We can only split a local catalogue into fit and test halves
+            default_order = min(3, auto_max_order)
+            log(
+                'Automatic order selection needs a local catalogue, using order %d'
+                % default_order
+            )
+            return default_order
+
+        log('Selecting the distortion degree using half of the catalogue as a test set')
+
+        cat_fit, cat_test = cat[::2], cat[1::2]
+        catname_fit = write_catalogue(cat_fit, os.path.join(workdir, 'catalogue_fit.cat'))
+
+        # Trial fits see only a half of the catalogue, and thus get roughly half
+        # the matches the final fit will have, so scale the requirement accordingly
+        scale = len(cat_fit) / len(cat)
+
+        results = {}
+        pairs = None
+
+        for o in range(1, auto_max_order + 1):
+            h, n, _ = run_scamp(o, catname=catname_fit, tag='_auto', quiet=True)
+
+            if h is None:
+                break
+
+            if n < scale * min_matches_for(o):
+                log(
+                    '  order %d: %d matches, less than %d needed'
+                    % (o, n, int(np.ceil(scale * min_matches_for(o))))
+                )
+                break
+
+            ra, dec = WCS(h).all_pix2world(obj['x'], obj['y'], 0)
+
+            if pairs is None:
+                # Fix the set of object - test star pairs using the lowest degree
+                # solution, so that all the degrees are compared on the same stars
+                oidx, cidx, dist = spherical_match(
+                    ra, dec, cat_test[cat_col_ra], cat_test[cat_col_dec], sr=sr
+                )
+
+                if not len(dist):
+                    break
+
+                # Keep only the nearest test star for every object
+                idx = np.argsort(dist)
+                _, first = np.unique(oidx[idx], return_index=True)
+                pairs = (oidx[idx][first], cidx[idx][first])
+
+            oidx, cidx = pairs
+            res = 3600 * np.median(
+                spherical_distance(
+                    ra[oidx], dec[oidx],
+                    cat_test[cat_col_ra][cidx], cat_test[cat_col_dec][cidx],
+                )
+            )
+            results[o] = res
+
+            log('  order %d: %d matches, test residual %.3f arcsec' % (o, n, res))
+
+        if not results:
+            log('Order selection failed, using order 1')
+            return 1
+
+        # Lowest degree that is within the threshold from the best residual
+        best_res = min(results.values())
+        best_order = min(o for o, res in results.items() if res <= best_res * (1 + auto_threshold))
+
+        log('Using distortion degree %d' % best_order)
+
+        return best_order
+
+    if order == 'auto':
+        order = select_order()
+
+    h1, n_matches, sigma = run_scamp(order, catname=catname)
+
+    # Degrade the distortion degree if there are not enough reference stars to
+    # constrain it, instead of just failing - lower order still beats no solution
+    while h1 is not None and n_matches < min_matches_for(order) and order > 1:
+        new_order = order - 1
+        while new_order > 1 and n_matches < min_matches_for(new_order):
+            new_order -= 1
+
+        log(
+            'Too few matches (%d < %d) for order %d, repeating with order %d'
+            % (n_matches, min_matches_for(order), order, new_order)
+        )
+        order = new_order
+        h1, n_matches, sigma = run_scamp(order, catname=catname)
+
+    wcs = None
+
+    if h1 is not None:
+        # Validate the solution quality using the actual residuals w.r.t. the
+        # reference catalogue. We do not check Chi2_Reference here - it is a
+        # reduced chi2 computed against the quoted per-star positional errors,
+        # and thus reflects how well these errors are estimated at least as much
+        # as the quality of the fit itself, so it is logged for information only.
+        if max_sigma is None:
+            max_sigma = 0.5 * sr * 3600
+
+        if n_matches < min_matches_for(order):
+            log(
+                'Too few matches (%d < %d), fitting likely failed'
+                % (n_matches, min_matches_for(order))
+            )
+        elif sigma is not None and sigma > max_sigma:
+            log(
+                'Residuals too large (%.2f > %.2f arcsec), fitting likely failed'
+                % (sigma, max_sigma)
+            )
+        elif get_header:
+            # FIXME: should we really return raw / unfixed header here?..
+            log('Returning raw header instead of WCS solution')
+            wcs = h1
         else:
-            with open(hdrname, 'r') as f:
-                h1 = fits.Header.fromstring(f.read().encode('ascii', 'ignore'), sep='\n')
+            wcs = WCS(h1)
 
-                # Sometimes SCAMP returns TAN type solution even despite PV keywords present
-                if h1['CTYPE1'] != 'RA---TPV' and 'PV1_0' in h1.keys():
-                    log(
-                        'Got WCS solution with CTYPE1 =',
-                        h1['CTYPE1'],
-                        ' and PV keywords, fixing it',
-                    )
-                    h1['CTYPE1'] = 'RA---TPV'
-                    h1['CTYPE2'] = 'DEC--TPV'
-                # .. while sometimes it does the opposite
-                elif h1['CTYPE1'] == 'RA---TPV' and 'PV1_0' not in h1.keys():
-                    log(
-                        'Got WCS solution with CTYPE1 =',
-                        h1['CTYPE1'],
-                        ' and without PV keywords, fixing it',
-                    )
-                    h1['CTYPE1'] = 'RA---TAN'
-                    h1['CTYPE2'] = 'DEC--TAN'
-                    h1 = WCS(h1).to_header(relax=True)
+            if update:
+                obj['ra'], obj['dec'] = wcs.all_pix2world(obj['x'], obj['y'], 0)
 
-                if get_header:
-                    # FIXME: should we really return raw / unfixed header here?..
-                    log('Returning raw header instead of WCS solution')
-                    wcs = h1
-                else:
-                    wcs = WCS(h1)
-
-                    if update:
-                        obj['ra'], obj['dec'] = wcs.all_pix2world(obj['x'], obj['y'], 0)
-
-                    log(
-                        'Astrometric accuracy: %.2f" %.2f"'
-                        % (h1.get('ASTRRMS1', 0) * 3600, h1.get('ASTRRMS2', 0) * 3600)
-                    )
-
-    else:
-        log('Error', res, 'running SCAMP')
-        wcs = None
+            log(
+                'Astrometric accuracy: %.2f" %.2f"'
+                % (h1.get('ASTRRMS1', 0) * 3600, h1.get('ASTRRMS2', 0) * 3600)
+            )
 
     if _workdir is None:
         shutil.rmtree(workdir)
