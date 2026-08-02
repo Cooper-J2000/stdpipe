@@ -1,0 +1,84 @@
+name: Release
+
+# Triggered by pushing a v* tag, normally through ./release.sh which runs the
+# local pre-flight checks first. The distributions are always built here, from a
+# clean checkout of the tagged commit, so that what lands on PyPI is exactly
+# what is in git - never whatever happens to be in somebody's working tree.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      # The version comes from stdpipe/__init__.py, so it ends up in the
+      # artefact names. If they disagree with the tag, somebody bumped one
+      # without the other - stop before anything is published.
+      - name: Verify version matches the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Tag says: $VERSION"
+          ls -l dist/
+          for f in "stdpipe-$VERSION.tar.gz" "stdpipe-$VERSION-py3-none-any.whl"; do
+            if [ ! -f "dist/$f" ]; then
+              echo "::error::Expected dist/$f - stdpipe/__init__.py disagrees with tag $GITHUB_REF_NAME"
+              exit 1
+            fi
+          done
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
+      - name: Upload distributions as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Requires a Trusted Publisher configured at
+    # https://pypi.org/manage/project/stdpipe/settings/publishing/
+    # with workflow 'release.yaml' and environment name 'pypi'.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/stdpipe/
+
+    permissions:
+      id-token: write  # mints the short-lived OIDC token; no API token needed
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
