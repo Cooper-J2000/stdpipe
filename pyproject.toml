@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stdpipe"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Simple Transient Detection Pipeline"
 readme = "README.md"
 license = {file = "LICENSE.md"}
@@ -113,13 +113,31 @@ Changelog = "https://github.com/karpov-sv/stdpipe/commits/master"
 zip-safe = false
 include-package-data = true
 
+# Single source of truth for the version - parsed statically from stdpipe/__init__.py
+[tool.setuptools.dynamic]
+version = {attr = "stdpipe.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["stdpipe*"]
 exclude = ["tests*", "docs*", "notebooks*", "build*", "dist*"]
+# stdpipe/data/ has no __init__.py and is not meant to be importable - without
+# this it would be picked up as a namespace package, shipping the scripts in it
+namespaces = false
 
+# Listed explicitly rather than globbed, so that stray files in the working
+# directory (editor backups etc) can never end up in a release. Note that
+# data/legacysurvey.py is a one-off regeneration script, not shipped on purpose.
 [tool.setuptools.package-data]
-stdpipe = ["data/*"]
+stdpipe = [
+    "data/legacysurvey_bricks.fits.gz",
+    "data/ps1skycells.txt",
+]
+
+# data/legacysurvey.py is a one-off script for regenerating the bricks list, and
+# is picked up by the generic "all .py files" sdist rule - keep it out of the wheel
+[tool.setuptools.exclude-package-data]
+stdpipe = ["data/legacysurvey.py"]
 
 # ============================================================================
 # pytest configuration

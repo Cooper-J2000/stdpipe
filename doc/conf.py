@@ -75,17 +75,17 @@ author = "Sergey Karpov"
 # built documents.
 #
 
+# Single source of truth is stdpipe/__init__.py - parsed here as text so that
+# building the docs does not require importing the package and its dependencies
 version = "0.0"
 try:
-    setup_lines = open("../setup.py").readlines()
-    for line in setup_lines:
+    for line in open("../stdpipe/__init__.py").readlines():
         if line.startswith("__version__ = "):
             try:
                 version = line.split('"')[1]
             except IndexError:
                 version = line.split("'")[1]
             break
-    from setup import version
 except:
     pass
 
