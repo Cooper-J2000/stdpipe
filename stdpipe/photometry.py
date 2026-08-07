@@ -1082,7 +1082,7 @@ def get_objects_sep(
         # pixel outside each source's footprint, so the winpos aperture always
         # overlaps masked pixels by construction. Keep TRUNC / ALLMASKED /
         # NONPOSITIVE — those still convey real centroiding-quality info.
-        flag_win &= ~np.int_(sep.APER_HASMASKED)
+        flag_win &= ~int(sep.APER_HASMASKED)
     else:
         # Use initial positions from extraction
         xwin, ywin = obj0['x'], obj0['y']
