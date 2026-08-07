@@ -592,7 +592,9 @@ def match(
         & np.isfinite(cmag)
         & np.isfinite(cmag_err)
         & (zero_err > 0)  # Zero errors would give infinite weights in the fit
-        & ((oflags & ~accept_flags) == 0)
+        # Cast to signed int: NumPy 2 (NEP 50) raises OverflowError when a
+        # negative Python int (~accept_flags) meets an unsigned flags column
+        & ((np.asarray(oflags, int) & ~int(accept_flags)) == 0)
     )  # initial mask
     if cat_color is not None and (fit_color_term or force_color_term is not None):
         idx0 &= np.isfinite(ccolor)

@@ -1313,7 +1313,7 @@ def plot_mag_histogram(
     mag = obj[obj_col_mag]
     mag_sn = 1 / obj[obj_col_mag_err]
 
-    idx = (obj['flags'] & ~accept_flags) == 0
+    idx = (np.asarray(obj['flags'], int) & ~int(accept_flags)) == 0
 
     vmin = np.nanmin(mag)
     vmax = np.nanmax(mag)

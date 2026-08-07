@@ -1402,7 +1402,9 @@ def classify(
         if "flags" not in obj.colnames:
             obj.add_column(Column(np.zeros(len(obj), dtype=np.int32), name="flags"))
         # Reset existing bogus bit so output reflects this classification pass.
-        obj["flags"] &= ~FLAG_BOGUS
+        # Cast to signed int: NumPy 2 (NEP 50) raises OverflowError when a
+        # negative Python int (~FLAG_BOGUS) meets an unsigned flags column
+        obj["flags"] = np.asarray(obj["flags"], int) & ~int(FLAG_BOGUS)
         obj["flags"][predictions < 0] |= FLAG_BOGUS
 
     return obj
