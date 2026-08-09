@@ -97,8 +97,9 @@ def download(url, filename=None, overwrite=False, verbose=False):
 def get_obs_time(header=None, filename=None, string=None, get_datetime=False, verbose=False):
     """Extract date and time of observations from a FITS header or string.
 
-    Tries the following FITS keywords in order: ``DATE-OBS``, ``DATEOBS``,
-    ``DATE``, ``TIME-OBS``, ``TIMEOBS``, ``UT``, ``MJD``, ``JD``.
+    Tries the following FITS keywords in order: ``DATE-MID``, ``DATE-OBS``,
+    ``DATEOBS``, ``DATE``, ``TIME-OBS``, ``TIMEOBS``, ``UT``, ``MJD``, ``JD``.
+    ``DATE-MID`` (mid-exposure time) is preferred when present.
 
     Parameters
     ----------
@@ -166,7 +167,7 @@ def get_obs_time(header=None, filename=None, string=None, get_datetime=False, ve
         log('Loading FITS header from', filename)
         header = fits.getheader(filename)
 
-    for dkey in ['DATE-OBS', 'DATEOBS', 'DATE', 'TIME-OBS', 'TIMEOBS', 'UT', 'MJD', 'JD']:
+    for dkey in ['DATE-MID', 'DATE-OBS', 'DATEOBS', 'DATE', 'TIME-OBS', 'TIMEOBS', 'UT', 'MJD', 'JD']:
         if dkey in header:
             log('Found ' + dkey + ':', header[dkey])
             # First try to parse standard ISO time
