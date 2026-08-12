@@ -5,8 +5,16 @@ from matplotlib import rcParams
 import builtins
 
 from astropy.stats import mad_std
-from astropy.visualization import simple_norm, ImageNormalize
-from astropy.visualization.stretch import HistEqStretch
+from astropy.visualization import ImageNormalize
+from astropy.visualization.stretch import (
+    HistEqStretch,
+    LinearStretch,
+    SqrtStretch,
+    PowerStretch,
+    LogStretch,
+    AsinhStretch,
+    SinhStretch,
+)
 from astropy.convolution import Gaussian2DKernel, convolve, convolve_fft
 
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -14,6 +22,18 @@ from scipy.stats import binned_statistic_2d
 from scipy.spatial import Voronoi
 
 from . import photometry
+
+# Intensity stretches supported by imshow(), with the same parameters as the
+# ones Astropy simple_norm() would use. 'histeq' is handled separately as it
+# has to be constructed from the data itself
+STRETCHES = {
+    'linear': LinearStretch,
+    'sqrt': SqrtStretch,
+    'power': lambda: PowerStretch(2),
+    'log': lambda: LogStretch(1000),
+    'asinh': lambda: AsinhStretch(0.1),
+    'sinh': lambda: SinhStretch(0.3),
+}
 
 # Optional powerbin import
 try:
@@ -44,6 +64,45 @@ def colorbar(obj=None, ax=None, size="5%", pad=0.1):
     ax.get_figure().sca(ax)
 
 
+def _channel_cuts(value, ncolors):
+    """Broadcast a scalar or per-channel cut level onto all color channels"""
+    if value is None:
+        return None
+
+    value = np.atleast_1d(np.asarray(value, dtype=float))
+
+    if value.size == 1:
+        value = np.repeat(value, ncolors)
+
+    return value
+
+
+def _make_norm(image, good_idx, stretch, vmin=None, vmax=None):
+    """Construct the normalization object for a single 2D plane"""
+    if stretch == 'histeq':
+        # Use only valid pixels for histogram, avoid creating multiple copies
+        if vmin is not None or vmax is not None:
+            valid_mask = (
+                (image >= (vmin if vmin is not None else -np.inf))
+                & (image <= (vmax if vmax is not None else np.inf))
+                & good_idx
+            )
+            data = image[valid_mask]
+        else:
+            data = image[good_idx]
+
+        stretch = HistEqStretch(data)
+    elif not stretch:
+        stretch = LinearStretch()
+    elif stretch in STRETCHES:
+        stretch = STRETCHES[stretch]()
+    else:
+        raise ValueError(f"Unknown stretch: {stretch}")
+
+    # Cut levels not provided explicitly are derived from the data itself
+    return ImageNormalize(image, vmin=vmin, vmax=vmax, stretch=stretch)
+
+
 def imshow(
     image,
     qq=None,
@@ -64,19 +123,28 @@ def imshow(
     Parameters
     ----------
     image : ndarray
-        2D array to display.
+        2D array to display, or a three-color ``(H, W, 3)`` / ``(H, W, 4)`` one.
+        Matplotlib ignores ``norm``, ``vmin`` and ``vmax`` for color data and
+        expects it to be floats in ``0..1`` range, so for such images the
+        normalization is applied to the data itself, independently for every
+        color channel, in order to maximize the contrast of the details. Alpha
+        channel, if present, is passed through intact.
     qq : list of float, optional
         Two-element ``[low, high]`` percentile range for intensity normalization.
         Default is ``[0.5, 99.5]``. Overridden by explicit ``vmin`` / ``vmax``.
     mask : ndarray of bool, optional
         Boolean mask; masked pixels are excluded from intensity normalization.
+        For color images it may be either 2D, or per-channel and then collapsed
+        onto the pixel grid.
     show_colorbar : bool, optional
-        If True, display a colorbar alongside the image.
+        If True, display a colorbar alongside the image. Silently ignored for
+        color images where the data does not pass through a colormap.
     show_axis : bool, optional
         If True, display axis ticks and labels.
     stretch : str, optional
-        Intensity stretch: ``'linear'``, ``'log'``, ``'asinh'``, ``'histeq'``,
-        or any stretch supported by Astropy visualization.
+        Intensity stretch: ``'histeq'``, or any of the keys of :data:`STRETCHES`
+        (``'linear'``, ``'sqrt'``, ``'power'``, ``'log'``, ``'asinh'``,
+        ``'sinh'``).
     r0 : float, optional
         Gaussian smoothing sigma in pixels applied before display.
     ax : matplotlib.axes.Axes, optional
@@ -99,6 +167,17 @@ def imshow(
 
     # Store original shape for coordinate system
     orig_shape = image.shape
+
+    # Three-color (RGB) or four-channel (RGBA) data needs special handling
+    is_rgb = image.ndim == 3 and image.shape[-1] in (3, 4)
+    # Number of color channels to normalize, excluding the alpha one
+    ncolors = (3 if image.shape[-1] == 4 else image.shape[-1]) if is_rgb else 1
+
+    if is_rgb and mask is not None:
+        mask = np.asarray(mask)
+        if mask.ndim == 3:
+            # Collapse per-channel mask onto the pixel grid
+            mask = np.any(mask, axis=-1)
 
     # STEP 0: Region selection (FIRST, before any processing)
     if xlim is not None or ylim is not None:
@@ -129,16 +208,18 @@ def imshow(
         scale = max_plot_size / max(image.shape)
         from scipy.ndimage import zoom
 
-        image = zoom(image, scale, order=1)  # bilinear interpolation
+        # Color axis, if any, should not be rescaled
+        image = zoom(
+            image, (scale, scale, 1) if is_rgb else scale, order=1
+        )  # bilinear interpolation
         if mask is not None:
             mask = zoom(mask.astype(np.uint8), scale, order=0).astype(bool)
 
     # OPTIMIZATION 2: Use float32 instead of float64 for memory efficiency
-    if r0 is not None and r0 > 0:
-        # Need to convert for smoothing operation
-        image = image.astype(np.float32)
-    elif not np.issubdtype(image.dtype, np.floating):
-        # For integer images, convert for proper display
+    is_integer = not np.issubdtype(image.dtype, np.floating)
+
+    if (r0 is not None and r0 > 0) or is_integer:
+        # Need to convert for smoothing operation, or for proper display of integer images
         image = image.astype(np.float32)
     else:
         # Already floating point, use as-is
@@ -154,26 +235,51 @@ def imshow(
     else:
         good_idx = np.isfinite(image)
 
+    if is_rgb:
+        # Pixel is good only if all its color channels are
+        good_idx = np.all(good_idx, axis=-1)
+
     if mask is not None:
         good_idx &= ~mask
+
+    is_normalized = False
 
     if np.sum(good_idx):
         # OPTIMIZATION 4: FFT convolution for large images
         if r0 is not None and r0 > 0:
             kernel = Gaussian2DKernel(r0)
-            # Use FFT convolution for large images (much faster)
-            if fast and image.size > 1_000_000:
-                from astropy.convolution import convolve_fft
 
-                image = convolve_fft(
-                    image, kernel, mask=mask, boundary='extend', nan_treatment='fill', fill_value=0
+            def smooth(plane):
+                # Use FFT convolution for large images (much faster)
+                if fast and plane.size > 1_000_000:
+                    return convolve_fft(
+                        plane,
+                        kernel,
+                        mask=mask,
+                        boundary='extend',
+                        nan_treatment='fill',
+                        fill_value=0,
+                    )
+                else:
+                    return convolve(plane, kernel, mask=mask, boundary='extend')
+
+            if is_rgb:
+                # Every channel is smoothed independently
+                image = np.stack(
+                    [smooth(image[..., _]) for _ in range(image.shape[-1])], axis=-1
                 )
             else:
-                image = convolve(image, kernel, mask=mask, boundary='extend')
+                image = smooth(image)
 
         if qq is None and 'vmin' not in kwargs and 'vmax' not in kwargs:
             # Sane defaults for quantiles if no manual limits provided
             qq = [0.5, 99.5]
+
+        if is_rgb:
+            # Matplotlib ignores the cuts for color data, so we have to keep
+            # them aside and apply them to the data ourselves
+            vmin = _channel_cuts(kwargs.pop('vmin', None), ncolors)
+            vmax = _channel_cuts(kwargs.pop('vmax', None), ncolors)
 
         # OPTIMIZATION 5: Subsample for percentiles on large images
         if qq is not None:
@@ -185,9 +291,14 @@ def imshow(
                 good_coords = np.where(good_idx)
                 sample_idx = np.random.choice(len(good_coords[0]), max_pixels, replace=False)
                 sample_values = image[good_coords[0][sample_idx], good_coords[1][sample_idx]]
-                kwargs['vmin'], kwargs['vmax'] = np.percentile(sample_values, qq)
             else:
-                kwargs['vmin'], kwargs['vmax'] = np.percentile(image[good_idx], qq)
+                sample_values = image[good_idx]
+
+            if is_rgb:
+                # Percentiles are computed independently for every color channel
+                vmin, vmax = np.percentile(sample_values[..., :ncolors], qq, axis=0)
+            else:
+                kwargs['vmin'], kwargs['vmax'] = np.percentile(sample_values, qq)
 
         if not 'interpolation' in kwargs:
             # Rough heuristic to choose interpolation method based on image dimensions
@@ -197,30 +308,45 @@ def imshow(
                 kwargs['interpolation'] = 'bicubic'
 
         # OPTIMIZATION 6: Optimize stretch (especially histeq mode)
-        if stretch and stretch != 'linear':
-            if stretch == 'histeq':
-                # Use only valid pixels for histogram, avoid creating multiple copies
-                if 'vmin' in kwargs or 'vmax' in kwargs:
-                    vmin = kwargs.get('vmin', -np.inf)
-                    vmax = kwargs.get('vmax', np.inf)
-                    valid_mask = (image >= vmin) & (image <= vmax) & good_idx
-                    data = image[valid_mask]
-                else:
-                    data = image[good_idx]
+        if is_rgb:
+            # Matplotlib expects color data as floats in 0..1 range and ignores
+            # the normalization, so we have to apply it to the data ourselves
+            norm = kwargs.pop('norm', None)
+            image = image.astype(np.float32, copy=True)
+            is_normalized = True
 
-                kwargs['norm'] = ImageNormalize(
-                    stretch=HistEqStretch(data),
-                    vmin=kwargs.pop('vmin', None),
-                    vmax=kwargs.pop('vmax', None),
-                )
-            else:
-                kwargs['norm'] = simple_norm(
-                    image,
-                    stretch,
-                    min_cut=kwargs.pop('vmin', None),
-                    max_cut=kwargs.pop('vmax', None),
-                    power=2,
-                )
+            for i in range(ncolors):
+                cnorm = norm
+                if cnorm is None:
+                    cnorm = _make_norm(
+                        image[..., i],
+                        good_idx,
+                        stretch,
+                        vmin=None if vmin is None else vmin[i],
+                        vmax=None if vmax is None else vmax[i],
+                    )
+
+                image[..., i] = np.ma.filled(cnorm(image[..., i]), 0)
+
+        elif stretch and stretch != 'linear':
+            kwargs['norm'] = _make_norm(
+                image,
+                good_idx,
+                stretch,
+                vmin=kwargs.pop('vmin', None),
+                vmax=kwargs.pop('vmax', None),
+            )
+
+    if is_rgb:
+        if not is_normalized and is_integer:
+            # Nothing to derive the cuts from, so just assume the integer color
+            # data to be in its native 0..255 range
+            image = image / 255
+
+        # Matplotlib silently clips color data outside of 0..1 range, and chokes
+        # on non-finite values, so we have to sanitize it here - also for the
+        # degenerate case when there were no good pixels to normalize at all
+        image = np.clip(np.nan_to_num(image, nan=0, posinf=1, neginf=0), 0, 1)
 
     # CRITICAL: Preserve coordinate system (including region offset)
     if 'extent' not in kwargs:
@@ -243,7 +369,10 @@ def imshow(
         ax.set_axis_off()
     else:
         ax.set_axis_on()
-    if show_colorbar:
+    if is_rgb:
+        # Colorbar is meaningless for color data as it does not pass through a colormap
+        pass
+    elif show_colorbar:
         colorbar(img, ax=ax)
     else:
         # Mimic the extension of scaling limits if they are equal
