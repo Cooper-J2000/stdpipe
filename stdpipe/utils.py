@@ -3,6 +3,9 @@ import re
 import requests
 import dateutil
 import shlex
+import fcntl
+
+from contextlib import contextmanager
 
 from tqdm.auto import tqdm
 
@@ -37,6 +40,33 @@ def get_data_path(dataname):
     Returns full path to the data file located in the module data/ folder
     """
     return os.path.join(os.path.dirname(__file__), 'data', dataname)
+
+
+@contextmanager
+def file_lock(path):
+    """Exclusive inter-process lock using a companion ``<path>.lock`` file.
+
+    Based on ``fcntl.flock`` (advisory locking) - all cooperating processes
+    must acquire the lock before touching the file. The lock is automatically
+    released if the process dies, so no stale locks are possible. Lock files
+    are left behind (they are empty and harmless) as removing them would
+    race with other processes opening them.
+
+    The typical pattern for cache downloads is::
+
+        if not os.path.exists(filename):
+            with file_lock(filename):
+                if not os.path.exists(filename):  # re-check inside the lock
+                    ... download and write filename ...
+    """
+    lockpath = path + '.lock'
+    os.makedirs(os.path.dirname(lockpath) or '.', exist_ok=True)
+    with open(lockpath, 'w') as lockfile:
+        fcntl.flock(lockfile, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockfile, fcntl.LOCK_UN)
 
 
 def download(url, filename=None, overwrite=False, verbose=False):

@@ -732,3 +732,71 @@ class TestFilterCellsByFootprint:
             )
         assert keep[0]       # centre
         assert not keep[1]   # far outside
+
+
+# ========================================================================
+# TestFindSkycellsSurvey
+# ========================================================================
+
+
+class TestFindSkycellsSurvey:
+    """Test skycell URL generation for Legacy Survey 'ls' and 'ls11'."""
+
+    @pytest.fixture
+    def bricks(self):
+        t = Table()
+        t['brickname'] = ['1126p222', '3350p340']
+        t['ra'] = [112.6, 335.0]
+        t['dec'] = [22.2, 34.0]
+        t['survey'] = ['S', 'N']
+        return t
+
+    @pytest.mark.unit
+    def test_ls_urls_unchanged(self, bricks, monkeypatch):
+        """Legacy 'ls' survey must keep producing DR10/DR9 URLs."""
+        monkeypatch.setattr(templates, '__ls_skycells', bricks, raising=False)
+
+        urls = templates.find_skycells(112.6, 22.2, 0.05, band='r', survey='ls')
+        assert urls == [
+            'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr10/south/'
+            'coadd/112/1126p222/legacysurvey-1126p222-image-r.fits.fz'
+        ]
+
+        urls = templates.find_skycells(335.0, 34.0, 0.05, band='g', survey='ls')
+        assert urls == [
+            'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr9/north/'
+            'coadd/335/3350p340/legacysurvey-3350p340-image-g.fits.fz'
+        ]
+
+    @pytest.mark.unit
+    def test_ls11_urls(self, bricks, monkeypatch):
+        """Legacy Survey DR11 URLs point to dr11/south and dr11/north."""
+        monkeypatch.setattr(templates, '__ls11_skycells', bricks, raising=False)
+
+        urls = templates.find_skycells(112.6, 22.2, 0.05, band='r', survey='ls11')
+        assert urls == [
+            'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr11/south/'
+            'coadd/112/1126p222/legacysurvey-1126p222-image-r.fits.fz'
+        ]
+
+        urls = templates.find_skycells(335.0, 34.0, 0.05, band='z', survey='ls11')
+        assert urls == [
+            'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr11/north/'
+            'coadd/335/3350p340/legacysurvey-3350p340-image-z.fits.fz'
+        ]
+
+    @pytest.mark.unit
+    def test_ls11_mask_url(self, bricks, monkeypatch):
+        """DR11 mask cells use the single per-brick maskbits file."""
+        monkeypatch.setattr(templates, '__ls11_skycells', bricks, raising=False)
+
+        urls = templates.find_skycells(112.6, 22.2, 0.05, ext='mask', survey='ls11')
+        assert urls == [
+            'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr11/south/'
+            'coadd/112/1126p222/legacysurvey-1126p222-maskbits.fits.fz'
+        ]
+
+    @pytest.mark.unit
+    def test_unsupported_survey_raises(self):
+        with pytest.raises(RuntimeError):
+            templates.find_skycells(112.6, 22.2, 0.05, survey='ls99')

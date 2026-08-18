@@ -15,9 +15,11 @@ from astropy import units as u
 from astropy.time import Time
 
 from . import astrometry
+from . import utils
 
 catalogs = {
     'ps1': {'vizier': 'II/349/ps1', 'name': 'PanSTARRS DR1'},
+    'ps1dr2': {'vizier': 'II/389/ps1_dr2', 'name': 'PanSTARRS DR2'},
     'gaiadr2': {'vizier': 'I/345/gaia2', 'name': 'Gaia DR2', 'extra': ['E(BR/RP)']},
     'gaiaedr3': {'vizier': 'I/350/gaiaedr3', 'name': 'Gaia EDR3'},
     'gaiadr3syn': {
@@ -630,8 +632,9 @@ def augment_cat_bands(cat, catalog=None, verbose=False):
     cat : astropy.table.Table
         Input catalog to augment. Modified in-place.
     catalog : str, optional
-        Catalog type: 'ps1', 'atlas', 'gaiadr2', 'skymapper', 'apass',
-        'gaiadr3syn', 'sdss', '2mass', 'vhs'. If None, auto-detect from columns.
+        Catalog type: 'ps1', 'ps1dr2', 'atlas', 'gaiadr2', 'skymapper', 'apass',
+        'gaiadr3syn', 'sdss', '2mass', 'vhs', 'lsdr11'. If None, auto-detect
+        from columns.
     verbose : bool or callable, optional
         Logging control.
 
@@ -652,7 +655,7 @@ def augment_cat_bands(cat, catalog=None, verbose=False):
         log(f"Auto-detected catalog type: {catalog}")
 
     # Dispatch to appropriate helper
-    if catalog == 'ps1' or catalog == 'atlas':
+    if catalog in ('ps1', 'ps1dr2', 'atlas'):
         _augment_ps1(cat, verbose=verbose)
     elif catalog == 'gaiadr2':
         _augment_gaiadr2(cat, verbose=verbose)
@@ -668,6 +671,8 @@ def augment_cat_bands(cat, catalog=None, verbose=False):
         _augment_2mass(cat, verbose=verbose)
     elif catalog == 'vhs':
         _augment_vhs(cat, verbose=verbose)
+    elif catalog == 'lsdr11':
+        _augment_ps1(cat, verbose=verbose)
     else:
         log(f"Warning: Unknown catalog type '{catalog}'. Skipping augmentation.")
 
@@ -692,6 +697,8 @@ def get_cat_vizier(
     additional photometric bands are computed from analytical conversion formulae:
 
     - ``ps1`` — Pan-STARRS DR1, augmented with Johnson-Cousins B, V, R, I
+    - ``ps1dr2`` — Pan-STARRS DR2 (Vizier II/389), augmented with
+      Johnson-Cousins B, V, R, I
     - ``gaiadr2`` — Gaia DR2, augmented with Johnson-Cousins B, V, R, I, Pan-STARRS and SDSS
     - ``gaiaedr3`` — Gaia eDR3
     - ``gaiadr3syn`` — Gaia DR3 synthetic photometry from XP spectra
@@ -794,6 +801,260 @@ def get_cat_vizier(
     if augment_bands or True:
         # Augment catalogue with additional bandpasses
         augment_cat_bands(cat, catalog=catalog if catalog in catalogs else None, verbose=verbose)
+
+    return cat
+
+
+__lsdr11_bricks = None
+
+
+def get_cat_lsdr11(
+    ra0,
+    dec0,
+    sr0,
+    limit=-1,
+    filters={},
+    augment_bands=True,
+    _cachedir=None,
+    _tmpdir=None,
+    verbose=False,
+):
+    """Download Legacy Survey DR11 catalogue from NERSC tractor brick files.
+
+    The catalogue is not available from Vizier, so the per-brick Tractor
+    catalogues are fetched directly from the NERSC portal
+    (``https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr11/``) and cached
+    locally.  Model fluxes (nanomaggies, already corrected for Galactic
+    extinction) are converted to AB magnitudes, and the catalogue is then
+    augmented with Johnson-Cousins B, V, R, I via the same PS1-based
+    conversion formulae used for Pan-STARRS (LS griz is close to the PS1
+    photometric system).
+
+    Parameters
+    ----------
+    ra0 : float
+        Right Ascension of the field center in degrees.
+    dec0 : float
+        Declination of the field center in degrees.
+    sr0 : float
+        Field radius in degrees.
+    limit : int, optional
+        Maximum number of rows to return (``-1`` for unlimited).
+    filters : dict, optional
+        Column filters applied client-side. Keys are column names; values are
+        simple comparison expressions like ``'<20.0'`` or ``'>=10'``.
+    augment_bands : bool, optional
+        If True (default), augment photometry with derived bands.
+    _cachedir : str, optional
+        Directory for caching downloaded brick catalogues between calls.
+    _tmpdir : str, optional
+        Directory for temporary files (default cache location is
+        ``_tmpdir/lsdr11``).
+    verbose : bool or callable, optional
+        Whether to show verbose messages. May be boolean or a ``print``-like callable.
+
+    Returns
+    -------
+    astropy.table.Table or None
+        Catalogue with ``RAJ2000``/``DEJ2000`` and ``gmag``..``zmag`` columns,
+        or None if the query fails.
+    """
+
+    # Simple Wrapper around print for logging in verbose mode only
+    log = (verbose if callable(verbose) else print) if verbose else lambda *args, **kwargs: None
+
+    global __lsdr11_bricks
+
+    if __lsdr11_bricks is None:
+        # Load bricks information and store to global variable
+        __lsdr11_bricks = Table.read(
+            utils.get_data_path('legacysurvey_dr11_bricks.fits.gz'), format='fits'
+        )
+
+    cell_radius = 0.186  # Same brick size as for DR9/DR10
+
+    _, idx, _ = astrometry.spherical_match(
+        ra0, dec0, __lsdr11_bricks['ra'], __lsdr11_bricks['dec'], sr0 + cell_radius
+    )
+
+    candidates = __lsdr11_bricks[idx]
+
+    # Keep only bricks whose 0.25 x 0.25 deg box actually overlaps the
+    # requested circle - the coarse center-distance cut above overselects
+    # corner bricks, each of which is a whole ~20 MB download
+    dra = np.abs((candidates['ra'] - ra0 + 180) % 360 - 180)
+    dra = dra * np.cos(np.deg2rad(candidates['dec'])) - 0.125
+    ddec = np.abs(candidates['dec'] - dec0) - 0.125
+    sep = np.hypot(np.maximum(dra, 0), np.maximum(ddec, 0))
+    candidates = candidates[sep <= sr0]
+
+    if not len(candidates):
+        log('No DR11 bricks cover the requested region')
+        return None
+
+    # Normalize _cachedir
+    if _cachedir is not None:
+        _cachedir = os.path.expanduser(_cachedir)
+    else:
+        if _tmpdir is None:
+            _tmpdir = tempfile.gettempdir()
+        _cachedir = os.path.join(_tmpdir, 'lsdr11')
+        log('Cache location not specified, falling back to %s' % _cachedir)
+
+    os.makedirs(_cachedir, exist_ok=True)
+    log('Cache location is', _cachedir)
+
+    # Columns we actually need - the rest of the (large) brick tables is discarded
+    keep_cols = [
+        'brickname', 'brickid', 'objid', 'ra', 'dec', 'type', 'brick_primary',
+        'flux_g', 'flux_r', 'flux_i', 'flux_z',
+        'flux_ivar_g', 'flux_ivar_r', 'flux_ivar_i', 'flux_ivar_z',
+    ]
+
+    cats = []
+
+    for cell in candidates:
+        brick = str(cell['brickname'])
+        filename = os.path.join(_cachedir, 'tractor-%s.fits' % brick)
+
+        if os.path.exists(filename):
+            log('%s already downloaded' % brick)
+        else:
+            # Guard the download with an inter-process lock so that
+            # concurrent workers do not download the same brick in parallel;
+            # existence is re-checked inside the lock
+            with utils.file_lock(filename):
+                if os.path.exists(filename):
+                    log('%s already downloaded' % brick)
+                    continue
+
+                url = 'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/'
+                url += 'dr11/south/' if cell['survey'] == 'S' else 'dr11/north/'
+                url += 'tractor/%s/tractor-%s.fits' % (brick[:3], brick)
+
+                log('Downloading brick %s' % brick)
+
+                # utils.download() may leave a truncated file behind on failure -
+                # make sure we never mistake it for a complete download
+                if os.path.exists(filename + '.tmp'):
+                    os.unlink(filename + '.tmp')
+
+                if not utils.download(url, filename=filename + '.tmp', verbose=False):
+                    # Bricks in the north/south overlap region may be mis-assigned
+                    # by the (de-duplicated) bricks table - retry the other region
+                    if '/dr11/south/' in url:
+                        url = url.replace('/dr11/south/', '/dr11/north/')
+                    else:
+                        url = url.replace('/dr11/north/', '/dr11/south/')
+                    log('Retrying from the other DR11 region: %s' % url)
+                    if os.path.exists(filename + '.tmp'):
+                        os.unlink(filename + '.tmp')
+                    if not utils.download(url, filename=filename + '.tmp', verbose=False):
+                        log('Cannot download brick', brick)
+                        continue
+
+                # Keep only the columns we need, to save disk and memory
+                try:
+                    t = Table.read(filename + '.tmp', format='fits')
+                    t = t[[_ for _ in keep_cols if _ in t.colnames]]
+                    # Drop non-standard units ('nanomaggies' etc) to avoid
+                    # UnitsWarning flood on every subsequent read
+                    for _ in t.colnames:
+                        t[_].unit = None
+                    t.write(filename + '.tmp2', format='fits', overwrite=True)
+                    os.replace(filename + '.tmp2', filename)
+                except Exception:
+                    log('Cannot parse brick', brick)
+                    for _ in [filename + '.tmp', filename + '.tmp2']:
+                        if os.path.exists(_):
+                            os.unlink(_)
+                    continue
+                finally:
+                    if os.path.exists(filename + '.tmp'):
+                        os.unlink(filename + '.tmp')
+
+        if os.path.exists(filename):
+            try:
+                t = Table.read(filename, format='fits')
+                # Northern (BASS/MzLS) bricks have no i-band columns at all -
+                # fill missing flux columns with zeros (they become NaN
+                # magnitudes) so that stacking with southern bricks works
+                for _ in keep_cols:
+                    if _ not in t.colnames and _.startswith('flux'):
+                        t[_] = np.zeros(len(t), dtype=np.float32)
+                cats.append(t)
+            except Exception:
+                log('Cannot read cached brick', brick, '- removing it')
+                os.unlink(filename)
+
+    if not cats:
+        log('No DR11 catalogues could be retrieved')
+        return None
+
+    cat = vstack(cats, metadata_conflicts='silent')
+
+    log('Got', len(cat), 'raw entries from', len(cats), 'bricks')
+
+    # Keep only primary objects to avoid duplicates in brick overlap zones
+    if 'brick_primary' in cat.colnames:
+        cat = cat[cat['brick_primary'] == True]  # noqa: E712
+
+    # Convert fluxes (nanomaggies) to AB magnitudes
+    for band in ['g', 'r', 'i', 'z']:
+        flux = np.asarray(cat['flux_' + band], dtype=float)
+        ivar = np.asarray(cat['flux_ivar_' + band], dtype=float)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cat[band + 'mag'] = 22.5 - 2.5 * np.log10(np.where(flux > 0, flux, np.nan))
+            cat['e_' + band + 'mag'] = 1.086 / (
+                np.sqrt(np.where(ivar > 0, ivar, np.nan)) * np.where(flux > 0, flux, np.nan)
+            )
+
+    cat.rename_columns(['ra', 'dec'], ['RAJ2000', 'DEJ2000'])
+
+    # Restrict the catalogue to the requested circle
+    dist = astrometry.spherical_distance(ra0, dec0, cat['RAJ2000'], cat['DEJ2000'])
+    cat = cat[dist <= sr0]
+
+    log(len(cat), 'entries within %.3f deg of %.3f %.3f' % (sr0, ra0, dec0))
+
+    if not len(cat):
+        log('No DR11 entries in the requested region')
+        return None
+
+    # Apply simple client-side column filters like {'rmag': '<20.0'}
+    for col, expr in (filters or {}).items():
+        expr = str(expr).strip()
+        for op in ['<=', '>=', '==', '<', '>']:
+            if expr.startswith(op):
+                try:
+                    val = float(expr[len(op):])
+                except ValueError:
+                    break
+                if col not in cat.colnames:
+                    break
+                if op == '<':
+                    cat = cat[cat[col] < val]
+                elif op == '>':
+                    cat = cat[cat[col] > val]
+                elif op == '<=':
+                    cat = cat[cat[col] <= val]
+                elif op == '>=':
+                    cat = cat[cat[col] >= val]
+                else:
+                    cat = cat[cat[col] == val]
+                break
+
+    if limit is not None and limit > 0 and len(cat) > limit:
+        cat = cat[:limit]
+
+    log('Got', len(cat), 'entries after filtering')
+
+    cat.meta['name'] = 'Legacy Survey DR11'
+
+    if augment_bands:
+        # Augment catalogue with additional bandpasses
+        augment_cat_bands(cat, catalog='lsdr11', verbose=verbose)
 
     return cat
 

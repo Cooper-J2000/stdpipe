@@ -371,3 +371,225 @@ class TestCatalogAugmentation:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# ============================================================================
+# Pan-STARRS DR2 and Legacy Survey DR11 additions
+# ============================================================================
+
+
+class TestPS1DR2:
+    """Test the explicit Pan-STARRS DR2 catalog entry."""
+
+    @pytest.mark.unit
+    def test_ps1dr2_definition(self):
+        """ps1dr2 points to the Vizier DR2 table (II/389, not DR1's II/349)."""
+        assert 'ps1dr2' in catalogs.catalogs
+        assert catalogs.catalogs['ps1dr2']['vizier'] == 'II/389/ps1_dr2'
+        assert catalogs.catalogs['ps1dr2']['name'] == 'PanSTARRS DR2'
+
+    @pytest.mark.unit
+    def test_ps1dr2_augmentation(self):
+        """augment_cat_bands must treat ps1dr2 like ps1."""
+        cat = Table()
+        cat['gmag'] = [18.0]
+        cat['rmag'] = [17.5]
+        cat['imag'] = [17.2]
+        cat['zmag'] = [17.0]
+        cat['ymag'] = [16.8]
+        cat['e_gmag'] = [0.01]
+        cat['e_rmag'] = [0.01]
+        cat['e_imag'] = [0.01]
+        cat['e_zmag'] = [0.01]
+
+        catalogs.augment_cat_bands(cat, catalog='ps1dr2')
+
+        for col in ['Bmag', 'Vmag', 'Rmag', 'Imag', 'e_Bmag', 'g_SDSS', 'good']:
+            assert col in cat.colnames
+
+
+class TestLSDR11:
+    """Test Legacy Survey DR11 catalogue retrieval from tractor bricks."""
+
+    @pytest.fixture
+    def bricks(self):
+        t = Table()
+        t['brickname'] = ['0000p000']
+        t['ra'] = [0.05]
+        t['dec'] = [0.05]
+        t['survey'] = ['S']
+        return t
+
+    @pytest.fixture
+    def brick_table(self):
+        t = Table()
+        t['brickname'] = ['0000p000'] * 5
+        t['brickid'] = [1] * 5
+        t['objid'] = [0, 1, 2, 3, 4]
+        t['ra'] = [0.05, 0.055, 0.056, 0.057, 1.0]
+        t['dec'] = [0.05, 0.05, 0.05, 0.05, 1.0]
+        t['type'] = ['PSF'] * 5
+        t['brick_primary'] = [True, True, False, True, True]
+        t['flux_g'] = [100.0, 10.0, 100.0, 0.0, 100.0]
+        t['flux_r'] = [100.0, 10.0, 100.0, 5.0, 100.0]
+        t['flux_i'] = [100.0, 10.0, 100.0, 5.0, 100.0]
+        t['flux_z'] = [100.0, 10.0, 100.0, 5.0, 100.0]
+        t['flux_ivar_g'] = [1e4] * 5
+        t['flux_ivar_r'] = [1e4] * 5
+        t['flux_ivar_i'] = [1e4] * 5
+        t['flux_ivar_z'] = [1e4] * 5
+        return t
+
+    def _query(self, bricks, brick_table, monkeypatch, tmp_path, **kwargs):
+        monkeypatch.setattr(catalogs, '__lsdr11_bricks', bricks, raising=False)
+
+        def fake_download(url, filename=None, overwrite=False, verbose=False):
+            brick_table.write(filename, format='fits')
+            return True
+
+        monkeypatch.setattr(catalogs.utils, 'download', fake_download)
+
+        return catalogs.get_cat_lsdr11(
+            0.05, 0.05, 0.05, _cachedir=str(tmp_path), **kwargs
+        )
+
+    @pytest.mark.unit
+    def test_basic_query(self, bricks, brick_table, monkeypatch, tmp_path):
+        """brick_primary filtering, cone cut, flux->mag conversion."""
+        cat = self._query(bricks, brick_table, monkeypatch, tmp_path)
+
+        # 5 rows: one non-primary, one outside the circle
+        assert len(cat) == 3
+        assert 'RAJ2000' in cat.colnames and 'DEJ2000' in cat.colnames
+        assert 'ra' not in cat.colnames
+
+        # flux=100 nmgy -> mag 17.5; flux=10 nmgy -> mag 20.0
+        assert np.isclose(cat['gmag'][0], 17.5)
+        assert np.isclose(cat['rmag'][1], 20.0)
+        # e_mag = 1.086 / (sqrt(ivar) * flux)
+        assert np.isclose(cat['e_gmag'][0], 1.086 / (100.0 * 100.0))
+        # zero/negative flux -> NaN magnitude
+        assert np.isnan(cat['gmag'][2])
+
+        # Augmented columns
+        for col in ['Bmag', 'Vmag', 'Rmag', 'Imag', 'good']:
+            assert col in cat.colnames
+
+        assert cat.meta['name'] == 'Legacy Survey DR11'
+
+    @pytest.mark.unit
+    def test_brick_cache_reused(self, bricks, brick_table, monkeypatch, tmp_path):
+        """Second call must not re-download the brick."""
+        cat = self._query(bricks, brick_table, monkeypatch, tmp_path)
+        assert len(cat) == 3
+        assert len(list(tmp_path.glob('tractor-*.fits'))) == 1
+
+        def failing_download(*args, **kwargs):
+            raise AssertionError('download called despite cache')
+
+        monkeypatch.setattr(catalogs.utils, 'download', failing_download)
+        cat = self._query(bricks, brick_table, monkeypatch, tmp_path)
+        assert len(cat) == 3
+
+    @pytest.mark.unit
+    def test_filters_and_limit(self, bricks, brick_table, monkeypatch, tmp_path):
+        """Vizier-style filters and row limit are applied client-side."""
+        cat = self._query(
+            bricks, brick_table, monkeypatch, tmp_path, filters={'rmag': '<18'}
+        )
+        assert len(cat) == 1
+        assert np.isclose(cat['rmag'][0], 17.5)
+
+        cat = self._query(bricks, brick_table, monkeypatch, tmp_path, limit=2)
+        assert len(cat) == 2
+
+    @pytest.mark.unit
+    def test_no_bricks(self, monkeypatch, tmp_path):
+        """Region outside the DR11 footprint returns None."""
+        empty = Table()
+        empty['brickname'] = ['0000p000']
+        empty['ra'] = [180.0]
+        empty['dec'] = [-80.0]
+        empty['survey'] = ['S']
+
+        monkeypatch.setattr(catalogs, '__lsdr11_bricks', empty, raising=False)
+
+        cat = catalogs.get_cat_lsdr11(0.05, 0.05, 0.01, _cachedir=str(tmp_path))
+        assert cat is None
+
+    @pytest.mark.unit
+    def test_download_failure_other_region(self, bricks, brick_table, monkeypatch, tmp_path):
+        """Failed download from one region falls back to the other."""
+        monkeypatch.setattr(catalogs, '__lsdr11_bricks', bricks, raising=False)
+
+        calls = []
+
+        def flaky_download(url, filename=None, overwrite=False, verbose=False):
+            calls.append(url)
+            if '/dr11/south/' in url:
+                return False
+            brick_table.write(filename, format='fits')
+            return True
+
+        monkeypatch.setattr(catalogs.utils, 'download', flaky_download)
+
+        cat = catalogs.get_cat_lsdr11(0.05, 0.05, 0.05, _cachedir=str(tmp_path))
+        assert len(cat) == 3
+        assert any('/dr11/south/' in u for u in calls)
+        assert any('/dr11/north/' in u for u in calls)
+
+    @pytest.mark.unit
+    def test_north_brick_without_iband(self, bricks, monkeypatch, tmp_path):
+        """Northern bricks lack flux_i entirely - magnitudes must become NaN."""
+        t = Table()
+        t['brickname'] = ['0000p000']
+        t['brickid'] = [1]
+        t['objid'] = [0]
+        t['ra'] = [0.05]
+        t['dec'] = [0.05]
+        t['type'] = ['PSF']
+        t['brick_primary'] = [True]
+        t['flux_g'] = [100.0]
+        t['flux_r'] = [100.0]
+        t['flux_z'] = [100.0]
+        t['flux_ivar_g'] = [1e4]
+        t['flux_ivar_r'] = [1e4]
+        t['flux_ivar_z'] = [1e4]
+        # no flux_i / flux_ivar_i at all
+
+        cat = self._query(bricks, t, monkeypatch, tmp_path)
+        assert len(cat) == 1
+        assert np.isclose(cat['gmag'][0], 17.5)
+        assert np.isnan(cat['imag'][0])
+        assert np.isnan(cat['e_imag'][0])
+
+    @pytest.mark.unit
+    def test_corner_bricks_skipped(self, monkeypatch, tmp_path):
+        """Bricks whose box does not overlap the circle are not downloaded."""
+        t = Table()
+        t['brickname'] = ['0000p000', '0000p001']
+        t['ra'] = [0.05, 0.25]   # second brick: center 0.2 deg away in RA
+        t['dec'] = [0.05, 0.05]
+        t['survey'] = ['S', 'S']
+        monkeypatch.setattr(catalogs, '__lsdr11_bricks', t, raising=False)
+
+        downloaded = []
+
+        def fake_download(url, filename=None, overwrite=False, verbose=False):
+            downloaded.append(url)
+            bt = Table()
+            bt['ra'] = [0.05]
+            bt['dec'] = [0.05]
+            bt['brick_primary'] = [True]
+            bt['flux_g'] = [100.0]
+            bt['flux_ivar_g'] = [1e4]
+            bt.write(filename, format='fits')
+            return True
+
+        monkeypatch.setattr(catalogs.utils, 'download', fake_download)
+
+        cat = catalogs.get_cat_lsdr11(0.05, 0.05, 0.05, _cachedir=str(tmp_path))
+        assert len(cat) == 1
+        # 0.2 deg - 0.125 (half brick) = 0.075 > 0.05: no overlap, not downloaded
+        assert len(downloaded) == 1
+        assert 'tractor-0000p000' in downloaded[0]

@@ -6,6 +6,7 @@ import tempfile
 import shlex
 import time
 import shutil
+import hashlib
 
 from urllib.parse import urlencode
 
@@ -43,6 +44,8 @@ def get_hips_image(
     upscale=False,
     get_header=True,
     verbose=False,
+    _cachedir=None,
+    _overwrite=False,
 ):
     """Load an image from any HiPS survey using the CDS hips2fits service.
 
@@ -85,6 +88,12 @@ def get_hips_image(
         If True, also return the FITS header alongside the image.
     verbose : bool or callable, optional
         Whether to show verbose messages. May be boolean or a ``print``-like callable.
+    _cachedir : str, optional
+        Directory for caching downloaded HiPS tiles between calls. Requests
+        are canonicalized (grid-aligned center, padded size) so that repeated
+        or slightly offset tasks at the same sky position share cached tiles.
+    _overwrite : bool, optional
+        If True, re-download the tile even if already cached.
 
     Returns
     -------
@@ -157,58 +166,158 @@ def get_hips_image(
         log('Sky position and size are not provided')
         return (None, None) if get_header else None
 
-    for baseurl in [
-        'https://alasky.u-strasbg.fr/hips-image-services/hips2fits',
-        'https://alaskybis.u-strasbg.fr/hips-image-services/hips2fits',
-    ]:
-        url = baseurl + '?' + urlencode(params)
+    if (
+        _cachedir is not None
+        and wcs is not None
+        and wcs.is_celestial
+        and not (upscale and upscale > 1)
+    ):
+        # Cached path: request a canonical (grid-aligned, padded) tile and
+        # store it under _cachedir, then reproject it onto the exact grid.
+        # Repeated or slightly offset tasks at the same sky position then
+        # share cached tiles instead of each downloading its own cutout.
+        tilefile, twcs, twidth, theight = _hips_canonical_tile(
+            hips, wcs, int(width), int(height), _cachedir
+        )
 
-        try:
-            t0 = time.time()
-            hdu = fits.open(url)
-            t1 = time.time()
-            log('Downloaded HiPS image in %.2f s' % (t1 - t0))
-            break
-        except Exception:
-            log('Failed downloading HiPS image from', url)
-            hdu = None
-
-    if hdu is None:
-        log('Cannot download HiPS image!')
-        if get_header:
-            return None, None
+        if os.path.exists(tilefile) and not _overwrite:
+            log('Using cached HiPS tile', os.path.split(tilefile)[-1])
         else:
-            return None
+            # Inter-process lock so concurrent workers do not download the
+            # same tile in parallel; re-check existence inside the lock
+            with utils.file_lock(tilefile):
+                if not (os.path.exists(tilefile) and not _overwrite):
+                    tparams = dict(params)
+                    tparams['width'] = twidth
+                    tparams['height'] = theight
 
-    image = hdu[0].data.astype(np.double)
-    header = hdu[0].header
+                    thdr = twcs.to_header(relax=True)
+                    if thdr['CTYPE1'] == 'RA---TPV' and 'PV1_0' not in thdr.keys():
+                        # hips2fits does not like such headers, let's fix it
+                        thdr['CTYPE1'] = 'RA---TAN'
+                        thdr['CTYPE2'] = 'DEC--TAN'
+                    tparams['wcs'] = json.dumps(dict(thdr))
 
-    # FIXME: hips2fits does not properly return the header for SIP WCS, so we just copy the original WCS over it
-    if wcs is not None and wcs.sip is not None:
-        wheader = wcs.to_header(relax=True)
-        header.update(wheader)
+                    for baseurl in [
+                        'https://alasky.u-strasbg.fr/hips-image-services/hips2fits',
+                        'https://alaskybis.u-strasbg.fr/hips-image-services/hips2fits',
+                    ]:
+                        url = baseurl + '?' + urlencode(tparams)
 
-    hdu.close()
+                        try:
+                            t0 = time.time()
+                            # cache=False - do not grow astropy's URL cache,
+                            # we keep our own persistent tile cache instead
+                            hdu = fits.open(url, cache=False)
+                            t1 = time.time()
+                            log('Downloaded HiPS tile in %.2f s' % (t1 - t0))
+                            break
+                        except Exception:
+                            log('Failed downloading HiPS tile from', url)
+                            hdu = None
 
-    if asinh is None:
-        # All PanSTARRS bands except g are stored in asinh scaling, as of May 2023
-        if 'PanSTARRS' in hips and hips != 'PanSTARRS/DR1/g':
-            asinh = True
+                    if hdu is None:
+                        log('Cannot download HiPS image!')
+                        if get_header:
+                            return None, None
+                        else:
+                            return None
 
-    if asinh:
-        # Fix asinh flux scaling
-        # image = np.sinh(image*np.log(10)/2.5)
-        x = image * 0.4 * np.log(10)
-        image = np.exp(x) - np.exp(-x)
+                    timage = hdu[0].data.astype(np.double)
+                    theader = hdu[0].header
 
-    if wcs_orig is not None:
-        # We should do downscaling after conversion of the image back to linear flux scaling
-        log('Downscaling the image %dx' % upscale)
-        image = utils.rebin_image(image, upscale)
-        # The header from hips2fits describes the upscaled grid - restore the original WCS
-        header.update(wcs_orig.to_header(relax=True))
-        header['NAXIS1'] = image.shape[1]
-        header['NAXIS2'] = image.shape[0]
+                    # FIXME: hips2fits does not properly return the header for
+                    # SIP WCS, so we just copy the requested WCS over it
+                    if twcs.sip is not None:
+                        theader.update(twcs.to_header(relax=True))
+
+                    hdu.close()
+
+                    # Linearize asinh-scaled surveys (like Pan-STARRS) before
+                    # storing the tile, so that the reprojection below
+                    # interpolates in linear flux space
+                    tasinh = asinh
+                    if tasinh is None:
+                        # All PanSTARRS bands except g are stored in asinh scaling, as of May 2023
+                        tasinh = 'PanSTARRS' in hips and hips != 'PanSTARRS/DR1/g'
+                    if tasinh:
+                        x = timage * 0.4 * np.log(10)
+                        timage = np.exp(x) - np.exp(-x)
+
+                    # Write atomically so that an interrupted write does not
+                    # leave a truncated file in the cache
+                    fits.writeto(tilefile + '.tmp', timage, theader, overwrite=True)
+                    os.replace(tilefile + '.tmp', tilefile)
+
+        # Reproject the cached tile onto the exact requested grid
+        image = reproject_lanczos(
+            [tilefile], wcs=wcs, width=int(width), height=int(height), verbose=verbose
+        )
+
+        if image is None:
+            log('Cannot reproject cached HiPS tile onto the requested grid!')
+            if get_header:
+                return None, None
+            else:
+                return None
+
+        header = wcs.to_header(relax=True)
+        header['NAXIS1'] = int(width)
+        header['NAXIS2'] = int(height)
+
+    else:
+        for baseurl in [
+            'https://alasky.u-strasbg.fr/hips-image-services/hips2fits',
+            'https://alaskybis.u-strasbg.fr/hips-image-services/hips2fits',
+        ]:
+            url = baseurl + '?' + urlencode(params)
+
+            try:
+                t0 = time.time()
+                hdu = fits.open(url)
+                t1 = time.time()
+                log('Downloaded HiPS image in %.2f s' % (t1 - t0))
+                break
+            except Exception:
+                log('Failed downloading HiPS image from', url)
+                hdu = None
+
+        if hdu is None:
+            log('Cannot download HiPS image!')
+            if get_header:
+                return None, None
+            else:
+                return None
+
+        image = hdu[0].data.astype(np.double)
+        header = hdu[0].header
+
+        # FIXME: hips2fits does not properly return the header for SIP WCS, so we just copy the original WCS over it
+        if wcs is not None and wcs.sip is not None:
+            wheader = wcs.to_header(relax=True)
+            header.update(wheader)
+
+        hdu.close()
+
+        if asinh is None:
+            # All PanSTARRS bands except g are stored in asinh scaling, as of May 2023
+            if 'PanSTARRS' in hips and hips != 'PanSTARRS/DR1/g':
+                asinh = True
+
+        if asinh:
+            # Fix asinh flux scaling
+            # image = np.sinh(image*np.log(10)/2.5)
+            x = image * 0.4 * np.log(10)
+            image = np.exp(x) - np.exp(-x)
+
+        if wcs_orig is not None:
+            # We should do downscaling after conversion of the image back to linear flux scaling
+            log('Downscaling the image %dx' % upscale)
+            image = utils.rebin_image(image, upscale)
+            # The header from hips2fits describes the upscaled grid - restore the original WCS
+            header.update(wcs_orig.to_header(relax=True))
+            header['NAXIS1'] = image.shape[1]
+            header['NAXIS2'] = image.shape[0]
 
     if normalize:
         # Normalize the image to have median=100 and std=10, corresponding to GAIN=1 assuming Poissonian background
@@ -223,6 +332,57 @@ def get_hips_image(
         return image, header
     else:
         return image
+
+
+def _hips_canonical_tile(hips, wcs, width, height, _cachedir):
+    """Compute a canonical (grid-aligned, padded) tile request for caching.
+
+    The tile keeps the pixel transform (scale, rotation, flip) of the
+    requested WCS verbatim, but its center is snapped to a fixed sky grid
+    with half-field spacing, and its size is padded so that the tile still
+    fully covers the request after the center shift. Nearby tasks therefore
+    map onto the same cached tile.
+
+    Returns ``(filename, tile_wcs, tile_width, tile_height)``.
+    """
+    from astropy.wcs.utils import proj_plane_pixel_scales
+
+    # deg/pix
+    pixscale = float(np.mean(proj_plane_pixel_scales(wcs.celestial)))
+
+    cra, cdec = wcs.wcs.crval[:2]
+
+    # Snap the center to a grid with half-field spacing
+    step = 0.5 * max(width, height) * pixscale
+    qra = np.round(cra / step) * step % 360
+    qdec = np.clip(np.round(cdec / step) * step, -90, 90)
+
+    # Pad the tile so that it still covers the whole request after the
+    # center shift (at most step/2 along any axis), plus some slack
+    pad = int(np.ceil(0.25 * max(width, height))) + 32
+    twidth = int(np.ceil((width + 2 * pad) / 64)) * 64
+    theight = int(np.ceil((height + 2 * pad) / 64)) * 64
+
+    twcs = wcs.deepcopy()
+    twcs.wcs.crval = [qra, qdec]
+    twcs.wcs.crpix = [(twidth + 1) / 2, (theight + 1) / 2]
+    twcs.pixel_shape = (twidth, theight)
+
+    # Distinguish tiles by survey, padded size, grid-snapped center and the
+    # pixel transform (pixel scale, rotation, flip)
+    if hasattr(wcs.wcs, 'cd'):
+        transform = np.asarray(wcs.wcs.cd)
+    else:
+        transform = np.asarray(wcs.wcs.pc) * np.asarray(wcs.wcs.cdelt)[:, None]
+    thash = hashlib.md5(np.round(transform, 12).tobytes()).hexdigest()[:8]
+
+    safe_hips = hips.replace('CDS/P/', '').replace('/', '_')
+    filename = os.path.join(
+        _cachedir,
+        '%s_%dx%d_%.4f_%+.4f_%s.fits' % (safe_hips, twidth, theight, qra, qdec, thash),
+    )
+
+    return filename, twcs, twidth, theight
 
 
 def dilate_mask(mask, dilate=5):
@@ -410,6 +570,7 @@ def point_in_ps1(ra, dec):
 
 # Legacy Survey images
 __ls_skycells = None
+__ls11_skycells = None
 
 
 def point_in_ls(ra, dec):
@@ -476,7 +637,7 @@ def find_skycells(
     ext : str
         ``'image'`` or ``'mask'``.
     survey : str
-        ``'ps1'`` or ``'ls'``.
+        ``'ps1'``, ``'ls'`` (DR10 south + DR9 north), or ``'ls11'`` (DR11).
     wcs : `~astropy.wcs.WCS`, optional
         If provided together with *width*/*height*, used to reject
         cells that fall outside the actual rectangular image footprint
@@ -529,23 +690,32 @@ def find_skycells(
 
             results.append(url)
 
-    elif survey == 'ls':
-        global __ls_skycells
+    elif survey in ('ls', 'ls11'):
+        global __ls_skycells, __ls11_skycells
 
-        if __ls_skycells is None:
-            # Load skycells information and store to global variable
-            __ls_skycells = Table.read(
-                utils.get_data_path('legacysurvey_bricks.fits.gz'), format='fits'
-            )
+        if survey == 'ls':
+            if __ls_skycells is None:
+                # Load skycells information and store to global variable
+                __ls_skycells = Table.read(
+                    utils.get_data_path('legacysurvey_bricks.fits.gz'), format='fits'
+                )
+            bricks = __ls_skycells
+        else:
+            if __ls11_skycells is None:
+                # Load DR11 bricks information and store to global variable
+                __ls11_skycells = Table.read(
+                    utils.get_data_path('legacysurvey_dr11_bricks.fits.gz'), format='fits'
+                )
+            bricks = __ls11_skycells
 
         cell_radius = 0.186
 
         # Coarse spherical preselection
         _, idx, _ = astrometry.spherical_match(
-            ra, dec, __ls_skycells['ra'], __ls_skycells['dec'], sr + cell_radius
+            ra, dec, bricks['ra'], bricks['dec'], sr + cell_radius
         )
 
-        candidates = __ls_skycells[idx]
+        candidates = bricks[idx]
 
         # Refine against actual rectangular footprint when WCS is available
         if wcs is not None and width is not None and height is not None:
@@ -561,7 +731,10 @@ def find_skycells(
 
         for cell in candidates:
             url = 'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/'
-            url += 'dr10/south/' if (cell['survey'] == 'S') else 'dr9/north/'
+            if survey == 'ls':
+                url += 'dr10/south/' if (cell['survey'] == 'S') else 'dr9/north/'
+            else:
+                url += 'dr11/south/' if (cell['survey'] == 'S') else 'dr11/north/'
             url += 'coadd/%s/%s/' % (cell['brickname'][:3], cell['brickname'])
             if ext == 'mask':
                 url += (
@@ -583,14 +756,19 @@ def fits_open_remote(url, **kwargs):
     """
     Simple wrapper around astropy.io.fits.open() that handles cache corrution errors
     and downloads the image directly if necessary
+
+    astropy's own URL download cache is bypassed by default (``cache=False``):
+    survey files retrieved through this wrapper are stored in our own
+    persistent file caches, so letting astropy also keep a copy would only
+    grow ``~/.astropy/cache/download`` indefinitely with files that are
+    never re-used from there.
     """
+    kwargs.setdefault('cache', False)
+
     try:
-        # First try opening using the cache
         hdu = fits.open(url, **kwargs)
     except OSError:
-        # If that fails, cache may be corrupted - let's skip it
-        kwargs.update({'cache': False})
-
+        # If that fails, remote file may be broken - let's retry once
         try:
             hdu = fits.open(url, **kwargs)
         except Exception:
@@ -655,7 +833,7 @@ def get_skycells(
         cellname = os.path.basename(cell)
         filename = os.path.join(_cachedir, cellname)
 
-        if survey == 'ls' and filename.endswith('.fz'):
+        if survey in ('ls', 'ls11') and filename.endswith('.fz'):
             filename = os.path.splitext(filename)[0]
 
         if _cache_downscale > 1:
@@ -665,46 +843,64 @@ def get_skycells(
         if os.path.exists(filename) and not overwrite:
             log('%s already downloaded' % os.path.split(filename)[-1])
         else:
-            log('Downloading %s' % cellname)
+            # Guard the download with an inter-process lock so that concurrent
+            # workers do not download the same skycell file in parallel
+            with utils.file_lock(filename):
+                if os.path.exists(filename) and not overwrite:
+                    # Another process downloaded it while we waited for the lock
+                    log('%s already downloaded' % os.path.split(filename)[-1])
+                else:
+                    log('Downloading %s' % cellname)
 
-            hdu = fits_open_remote(cell)
-            if hdu is not None:
-                image, header = hdu[1].data, hdu[1].header
+                    hdu = fits_open_remote(cell)
+                    if hdu is None and survey == 'ls11':
+                        # Bricks in the north/south overlap region may be mis-assigned
+                        # by the (de-duplicated) bricks table - retry the other region
+                        if '/dr11/south/' in cell:
+                            alt = cell.replace('/dr11/south/', '/dr11/north/')
+                        else:
+                            alt = cell.replace('/dr11/north/', '/dr11/south/')
+                        log('Retrying from the other DR11 region: %s' % alt)
+                        hdu = fits_open_remote(alt)
+                        if hdu is not None:
+                            cell = alt
+                    if hdu is not None:
+                        image, header = hdu[1].data, hdu[1].header
 
-                if normalize:
-                    if survey == 'ps1':
-                        image, header = normalize_ps1_skycell(image, header)
+                        if normalize:
+                            if survey == 'ps1':
+                                image, header = normalize_ps1_skycell(image, header)
 
-                    if survey == 'ls' and ext == 'image':
-                        try:
-                            # Get invvar file to mask not covered regions
-                            ihdu = fits_open_remote(cell.replace('-image-', '-invvar-'))
-                            if ihdu is not None:
-                                invvar = ihdu[1].data
-                                image[invvar == 0] = np.nan
-                                ihdu.close()
-                        except Exception:
-                            pass
+                            if survey in ('ls', 'ls11') and ext == 'image':
+                                try:
+                                    # Get invvar file to mask not covered regions
+                                    ihdu = fits_open_remote(cell.replace('-image-', '-invvar-'))
+                                    if ihdu is not None:
+                                        invvar = ihdu[1].data
+                                        image[invvar == 0] = np.nan
+                                        ihdu.close()
+                                except Exception:
+                                    pass
 
-                if _cache_downscale > 1:
-                    image, header = cutouts.downscale_image(
-                        image,
-                        header=header,
-                        scale=_cache_downscale,
-                        mode='or' if ext == 'mask' else 'sum',
-                    )
+                        if _cache_downscale > 1:
+                            image, header = cutouts.downscale_image(
+                                image,
+                                header=header,
+                                scale=_cache_downscale,
+                                mode='or' if ext == 'mask' else 'sum',
+                            )
 
-                    log(
-                        "Downscaling the image and storing it as",
-                        os.path.split(filename)[-1],
-                    )
+                            log(
+                                "Downscaling the image and storing it as",
+                                os.path.split(filename)[-1],
+                            )
 
-                # Write atomically so that an interrupted write does not leave
-                # a truncated file in the cache
-                fits.writeto(filename + '.tmp', image, header, overwrite=True)
-                os.replace(filename + '.tmp', filename)
+                        # Write atomically so that an interrupted write does not leave
+                        # a truncated file in the cache
+                        fits.writeto(filename + '.tmp', image, header, overwrite=True)
+                        os.replace(filename + '.tmp', filename)
 
-                hdu.close()
+                        hdu.close()
 
         if os.path.exists(filename):
             filenames.append(filename)
@@ -779,7 +975,8 @@ def get_survey_image(
     ext : str, optional
         Data type: ``'image'`` or ``'mask'``.
     survey : str, optional
-        Survey name: ``'ps1'`` for Pan-STARRS or ``'ls'`` for Legacy Survey.
+        Survey name: ``'ps1'`` for Pan-STARRS, ``'ls'`` for Legacy Survey
+        (DR10 south + DR9 north), or ``'ls11'`` for Legacy Survey DR11.
     wcs : astropy.wcs.WCS, optional
         Output WCS projection.
     shape : tuple of int, optional

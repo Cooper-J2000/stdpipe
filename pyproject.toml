@@ -131,13 +131,15 @@ namespaces = false
 [tool.setuptools.package-data]
 stdpipe = [
     "data/legacysurvey_bricks.fits.gz",
+    "data/legacysurvey_dr11_bricks.fits.gz",
     "data/ps1skycells.txt",
 ]
 
-# data/legacysurvey.py is a one-off script for regenerating the bricks list, and
-# is picked up by the generic "all .py files" sdist rule - keep it out of the wheel
+# data/legacysurvey.py and data/legacysurvey_dr11.py are one-off scripts for
+# regenerating the bricks lists, and are picked up by the generic "all .py
+# files" sdist rule - keep them out of the wheel
 [tool.setuptools.exclude-package-data]
-stdpipe = ["data/legacysurvey.py"]
+stdpipe = ["data/legacysurvey.py", "data/legacysurvey_dr11.py"]
 
 # ============================================================================
 # pytest configuration
