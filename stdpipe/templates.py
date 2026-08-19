@@ -665,46 +665,53 @@ def get_skycells(
         if os.path.exists(filename) and not overwrite:
             log('%s already downloaded' % os.path.split(filename)[-1])
         else:
-            log('Downloading %s' % cellname)
+            # Guard the download with an inter-process lock so that concurrent
+            # workers do not download the same skycell file in parallel
+            with utils.file_lock(filename):
+                if os.path.exists(filename) and not overwrite:
+                    # Another process downloaded it while we waited for the lock
+                    log('%s already downloaded' % os.path.split(filename)[-1])
+                else:
+                    log('Downloading %s' % cellname)
 
-            hdu = fits_open_remote(cell)
-            if hdu is not None:
-                image, header = hdu[1].data, hdu[1].header
+                    hdu = fits_open_remote(cell)
+                    if hdu is not None:
+                        image, header = hdu[1].data, hdu[1].header
 
-                if normalize:
-                    if survey == 'ps1':
-                        image, header = normalize_ps1_skycell(image, header)
+                        if normalize:
+                            if survey == 'ps1':
+                                image, header = normalize_ps1_skycell(image, header)
 
-                    if survey == 'ls' and ext == 'image':
-                        try:
-                            # Get invvar file to mask not covered regions
-                            ihdu = fits_open_remote(cell.replace('-image-', '-invvar-'))
-                            if ihdu is not None:
-                                invvar = ihdu[1].data
-                                image[invvar == 0] = np.nan
-                                ihdu.close()
-                        except Exception:
-                            pass
+                            if survey == 'ls' and ext == 'image':
+                                try:
+                                    # Get invvar file to mask not covered regions
+                                    ihdu = fits_open_remote(cell.replace('-image-', '-invvar-'))
+                                    if ihdu is not None:
+                                        invvar = ihdu[1].data
+                                        image[invvar == 0] = np.nan
+                                        ihdu.close()
+                                except Exception:
+                                    pass
 
-                if _cache_downscale > 1:
-                    image, header = cutouts.downscale_image(
-                        image,
-                        header=header,
-                        scale=_cache_downscale,
-                        mode='or' if ext == 'mask' else 'sum',
-                    )
+                        if _cache_downscale > 1:
+                            image, header = cutouts.downscale_image(
+                                image,
+                                header=header,
+                                scale=_cache_downscale,
+                                mode='or' if ext == 'mask' else 'sum',
+                            )
 
-                    log(
-                        "Downscaling the image and storing it as",
-                        os.path.split(filename)[-1],
-                    )
+                            log(
+                                "Downscaling the image and storing it as",
+                                os.path.split(filename)[-1],
+                            )
 
-                # Write atomically so that an interrupted write does not leave
-                # a truncated file in the cache
-                fits.writeto(filename + '.tmp', image, header, overwrite=True)
-                os.replace(filename + '.tmp', filename)
+                        # Write atomically so that an interrupted write does not leave
+                        # a truncated file in the cache
+                        fits.writeto(filename + '.tmp', image, header, overwrite=True)
+                        os.replace(filename + '.tmp', filename)
 
-                hdu.close()
+                        hdu.close()
 
         if os.path.exists(filename):
             filenames.append(filename)
