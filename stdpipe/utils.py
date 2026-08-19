@@ -70,27 +70,18 @@ def file_lock(path):
         return
 
     lockpath = path + '.lock'
-    os.makedirs(os.path.dirname(lockpath) or '.', exist_ok=True)
+    fd = None
 
     try:
+        os.makedirs(os.path.dirname(lockpath) or '.', exist_ok=True)
+
         # The lock file never needs to be writable: flock() locks the open
         # file description, not the contents, so an exclusive lock on a
         # read-only fd is perfectly valid. Opening read-only also lets
         # other users sharing the cache directory acquire the lock even
         # when the file belongs to someone else.
         fd = os.open(lockpath, os.O_CREAT | os.O_RDONLY, 0o666)
-    except OSError:
-        # Lock unavailable (e.g. genuinely read-only cache directory) -
-        # degrade to running unlocked. This is safe as long as the caller
-        # writes atomically (e.g. .tmp file + os.replace); the lock is
-        # only an optimisation against duplicate concurrent downloads.
-        fd = None
 
-    if fd is None:
-        yield
-        return
-
-    try:
         # Make the lock usable by other users sharing the cache; the mode
         # above is masked by umask, and fails harmlessly if the file
         # belongs to someone else
@@ -100,9 +91,23 @@ def file_lock(path):
             pass
 
         fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        # Lock unavailable - e.g. a genuinely read-only cache directory, or a
+        # filesystem not supporting flock() at all (ENOLCK). Degrade to running
+        # unlocked. This is safe as long as the caller writes atomically (e.g.
+        # .tmp file + os.replace); the lock is only an optimisation against
+        # duplicate concurrent downloads.
+        if fd is not None:
+            os.close(fd)
+            fd = None
+
+    # Kept outside the block above so that errors raised by the caller are
+    # never mistaken for a failure to acquire the lock
+    try:
         yield
     finally:
-        os.close(fd)  # closing the descriptor releases the lock
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the lock
 
 
 def download(url, filename=None, overwrite=False, verbose=False):

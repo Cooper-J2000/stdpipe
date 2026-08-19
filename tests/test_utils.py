@@ -114,6 +114,15 @@ class TestDownload:
         pytest.skip("Network test - implement if needed")
 
 
+def _count_open_fds():
+    """Number of file descriptors open by this process, for leak checks"""
+    for path in ['/proc/self/fd', '/dev/fd']:
+        if os.path.isdir(path):
+            return len(os.listdir(path))
+
+    pytest.skip("Cannot enumerate open file descriptors on this platform")
+
+
 class TestFileLock:
     """Test inter-process file locking."""
 
@@ -187,6 +196,75 @@ class TestFileLock:
                 pass  # should degrade to unlocked instead of raising
         finally:
             os.chmod(ro_dir, stat.S_IRWXU)
+
+    @pytest.mark.unit
+    def test_file_lock_degrades_when_flock_unsupported(self, temp_dir, monkeypatch):
+        """Test that a filesystem not supporting flock() degrades to unlocked."""
+        if utils.fcntl is None:
+            pytest.skip("fcntl not available on this platform")
+
+        import errno
+
+        def unsupported(*args, **kwargs):
+            raise OSError(errno.ENOLCK, 'No locks available')
+
+        monkeypatch.setattr(utils.fcntl, 'flock', unsupported)
+
+        path = os.path.join(temp_dir, 'file.fits')
+
+        nfds = _count_open_fds()
+
+        with utils.file_lock(path):
+            pass  # should degrade to unlocked instead of raising
+
+        # The descriptor opened before the failed flock() must not be leaked
+        assert _count_open_fds() == nfds
+
+    @pytest.mark.unit
+    def test_file_lock_body_errors_are_not_swallowed(self, temp_dir):
+        """Test that exceptions from the guarded block propagate to the caller."""
+        path = os.path.join(temp_dir, 'file.fits')
+
+        with pytest.raises(OSError, match='from the body'):
+            with utils.file_lock(path):
+                raise OSError('from the body')
+
+    @pytest.mark.unit
+    def test_file_lock_import_guard(self, temp_dir):
+        """Test that stdpipe.utils imports and locks when fcntl is unavailable.
+
+        Covers the import guard itself, which cannot be exercised by patching
+        the already-imported module, so a fresh interpreter is used.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        code = textwrap.dedent(
+            """
+            import sys
+            # A None entry makes `import fcntl` raise ImportError, emulating
+            # a non-POSIX platform such as Windows
+            sys.modules['fcntl'] = None
+
+            from stdpipe import utils
+
+            assert utils.fcntl is None, 'import guard did not trigger'
+
+            # Bare filename also exercises the empty-dirname code path
+            with utils.file_lock('file.fits'):
+                pass
+
+            print('ok')
+            """
+        )
+
+        res = subprocess.run(
+            [sys.executable, '-c', code], capture_output=True, text=True, cwd=temp_dir
+        )
+
+        assert res.returncode == 0, res.stderr
+        assert 'ok' in res.stdout
 
 
 class TestFITSUtilities:
