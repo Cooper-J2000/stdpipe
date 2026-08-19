@@ -350,7 +350,9 @@ def _hips_canonical_tile(hips, wcs, width, height, _cachedir):
     # deg/pix
     pixscale = float(np.mean(proj_plane_pixel_scales(wcs.celestial)))
 
-    cra, cdec = wcs.wcs.crval[:2]
+    # Use the actual frame center, not CRVAL - the reference pixel (CRPIX)
+    # may lie well outside the image, making CRVAL a wrong center to snap
+    cra, cdec, _ = astrometry.get_frame_center(wcs=wcs, width=width, height=height)
 
     # Snap the center to a grid with half-field spacing
     step = 0.5 * max(width, height) * pixscale
