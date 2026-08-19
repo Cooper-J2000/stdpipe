@@ -61,12 +61,38 @@ def file_lock(path):
     """
     lockpath = path + '.lock'
     os.makedirs(os.path.dirname(lockpath) or '.', exist_ok=True)
-    with open(lockpath, 'w') as lockfile:
-        fcntl.flock(lockfile, fcntl.LOCK_EX)
+
+    try:
+        # The lock file never needs to be writable: flock() locks the open
+        # file description, not the contents, so an exclusive lock on a
+        # read-only fd is perfectly valid. Opening read-only also lets
+        # other users sharing the cache directory acquire the lock even
+        # when the file belongs to someone else.
+        fd = os.open(lockpath, os.O_CREAT | os.O_RDONLY, 0o666)
+    except OSError:
+        # Lock unavailable (e.g. genuinely read-only cache directory) -
+        # degrade to running unlocked. This is safe as long as the caller
+        # writes atomically (e.g. .tmp file + os.replace); the lock is
+        # only an optimisation against duplicate concurrent downloads.
+        fd = None
+
+    if fd is None:
+        yield
+        return
+
+    try:
+        # Make the lock usable by other users sharing the cache; the mode
+        # above is masked by umask, and fails harmlessly if the file
+        # belongs to someone else
         try:
-            yield
-        finally:
-            fcntl.flock(lockfile, fcntl.LOCK_UN)
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
 
 
 def download(url, filename=None, overwrite=False, verbose=False):
