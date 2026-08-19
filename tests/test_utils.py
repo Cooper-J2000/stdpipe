@@ -114,6 +114,81 @@ class TestDownload:
         pytest.skip("Network test - implement if needed")
 
 
+class TestFileLock:
+    """Test inter-process file locking."""
+
+    @pytest.mark.unit
+    def test_file_lock_basic(self, temp_dir):
+        """Test that the lock context manager works and leaves the lock file behind."""
+        path = os.path.join(temp_dir, 'file.fits')
+
+        with utils.file_lock(path):
+            assert os.path.exists(path + '.lock')
+
+        # Lock file is left behind (empty and harmless)
+        assert os.path.exists(path + '.lock')
+
+    @pytest.mark.unit
+    def test_file_lock_mutual_exclusion(self, temp_dir):
+        """Test that two processes never hold the lock at the same time."""
+        if utils.fcntl is None:
+            pytest.skip("fcntl not available on this platform")
+
+        import multiprocessing
+        import time
+
+        path = os.path.join(temp_dir, 'file.fits')
+
+        def worker(queue):
+            with utils.file_lock(path):
+                t1 = time.time()
+                time.sleep(0.3)
+                t2 = time.time()
+            queue.put((t1, t2))
+
+        ctx = multiprocessing.get_context('fork')
+        queue = ctx.Queue()
+        procs = [ctx.Process(target=worker, args=(queue,)) for _ in range(2)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+
+        intervals = sorted(queue.get() for _ in range(2))
+        # Second interval starts only after the first one ends
+        assert intervals[1][0] >= intervals[0][1]
+
+    @pytest.mark.unit
+    def test_file_lock_noop_without_fcntl(self, temp_dir, monkeypatch):
+        """Test that file_lock degrades to a no-op when fcntl is unavailable."""
+        monkeypatch.setattr(utils, 'fcntl', None)
+
+        path = os.path.join(temp_dir, 'file.fits')
+
+        with utils.file_lock(path):
+            pass  # should just proceed
+
+        # No lock file is created in no-op mode
+        assert not os.path.exists(path + '.lock')
+
+    @pytest.mark.unit
+    def test_file_lock_degrades_on_readonly_dir(self, temp_dir):
+        """Test that an unwritable directory degrades to running unlocked."""
+        if utils.fcntl is None:
+            pytest.skip("fcntl not available on this platform")
+
+        import stat
+
+        ro_dir = os.path.join(temp_dir, 'readonly')
+        os.makedirs(ro_dir)
+        os.chmod(ro_dir, stat.S_IRUSR | stat.S_IXUSR)  # 0o500
+        try:
+            with utils.file_lock(os.path.join(ro_dir, 'file.fits')):
+                pass  # should degrade to unlocked instead of raising
+        finally:
+            os.chmod(ro_dir, stat.S_IRWXU)
+
+
 class TestFITSUtilities:
     """Test FITS header parsing and utilities."""
 

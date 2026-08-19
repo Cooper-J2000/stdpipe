@@ -3,7 +3,11 @@ import re
 import requests
 import dateutil
 import shlex
-import fcntl
+
+try:
+    import fcntl
+except ImportError:  # Windows and other non-POSIX platforms
+    fcntl = None
 
 from contextlib import contextmanager
 
@@ -59,6 +63,12 @@ def file_lock(path):
                 if not os.path.exists(filename):  # re-check inside the lock
                     ... download and write filename ...
     """
+    if fcntl is None:
+        # No advisory locking available (non-POSIX platform) - proceed
+        # without deduplication, keeping the pre-locking behaviour
+        yield
+        return
+
     lockpath = path + '.lock'
     os.makedirs(os.path.dirname(lockpath) or '.', exist_ok=True)
 
