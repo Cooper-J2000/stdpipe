@@ -674,7 +674,17 @@ def get_skycells(
                 else:
                     log('Downloading %s' % cellname)
 
-                    hdu = fits_open_remote(cell)
+                    try:
+                        # Bypass astropy's URL cache - the file is stored in
+                        # our own persistent cache below, so a second copy in
+                        # ~/.astropy/cache/download would never be re-used
+                        hdu = fits.open(cell, cache=False)
+                    except Exception:
+                        import traceback
+
+                        traceback.print_exc()
+
+                        hdu = None
                     if hdu is not None:
                         image, header = hdu[1].data, hdu[1].header
 
@@ -685,7 +695,7 @@ def get_skycells(
                             if survey == 'ls' and ext == 'image':
                                 try:
                                     # Get invvar file to mask not covered regions
-                                    ihdu = fits_open_remote(cell.replace('-image-', '-invvar-'))
+                                    ihdu = fits.open(cell.replace('-image-', '-invvar-'), cache=False)
                                     if ihdu is not None:
                                         invvar = ihdu[1].data
                                         image[invvar == 0] = np.nan
