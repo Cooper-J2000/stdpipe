@@ -18,6 +18,12 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from . import astrometry
 
+# Smallest fit scale still carrying usable scatter information. The fits are
+# performed on residuals normalized by the noise model, so the scale is
+# dimensionless and ~1 when the noise model describes the data; anything this
+# small means the fit is perfect down to floating-point roundoff.
+_MIN_FIT_SCALE = 1e-8
+
 
 def make_series(mul=1.0, x=1.0, y=1.0, order=1, sum=False, zero=True):
     x = np.atleast_1d(x)
@@ -592,7 +598,9 @@ def match(
         & np.isfinite(cmag)
         & np.isfinite(cmag_err)
         & (zero_err > 0)  # Zero errors would give infinite weights in the fit
-        & ((oflags & ~accept_flags) == 0)
+        # Cast to signed int: NumPy 2 (NEP 50) raises OverflowError when a
+        # negative Python int (~accept_flags) meets an unsigned flags column
+        & ((np.asarray(oflags, int) & ~int(accept_flags)) == 0)
     )  # initial mask
     if cat_color is not None and (fit_color_term or force_color_term is not None):
         idx0 &= np.isfinite(ccolor)
@@ -617,10 +625,8 @@ def match(
         else:
             C = sm.WLS(zero[idx], X[idx], weights=1 / total_err[idx] ** 2).fit()
 
-        # Perfect fit is fatal for RLM iterations, and whenever the scale
-        # is used for re-scaling the noise model
-        if not np.isfinite(C.scale) or (C.scale == 0.0 and (robust or scale_noise)):
-            log('Fit failed - fit scale collapsed to zero, model is degenerate')
+        if not np.isfinite(C.scale):
+            log('Fit failed - fit scale is not finite, model is degenerate')
             return None
 
         # RLM scale is a standard deviation while WLS one is a variance
@@ -650,8 +656,16 @@ def match(
 
         if scale_noise:
             # The fit scale measures residual scatter relative to the noise
-            # model used in this fit, so the applied scaling is cumulative
-            scale_err = scale_err * fit_scale
+            # model used in this fit, so the applied scaling is cumulative.
+            # Both fit branches normalize the residuals by the noise model, so
+            # fit_scale is dimensionless and ~1 for a well-described fit. A
+            # vanishing value means the model reproduces the data down to
+            # roundoff, leaving no scatter information to rescale with -- keep
+            # the noise model as is instead of collapsing it to zero.
+            if fit_scale > _MIN_FIT_SCALE:
+                scale_err = scale_err * fit_scale
+            else:
+                log('Fit scale is negligible - keeping the noise model unscaled')
 
         intrinsic_rms = (
             get_intrinsic_scatter((zero - zero_model)[idx], (zero_err * scale_err)[idx], max=max_intrinsic_rms)

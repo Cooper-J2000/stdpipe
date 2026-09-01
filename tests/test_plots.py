@@ -162,6 +162,139 @@ def test_imshow_histeq_sets_norm():
         plt.close(fig)
 
 
+@pytest.fixture
+def rgb_image():
+    """Three-color image with wildly different levels in every channel"""
+    rng = np.random.default_rng(42)
+
+    return np.stack(
+        [rng.normal(level, 0.1 * level, (32, 32)) for level in [10, 100, 1000]],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def test_imshow_rgb_normalizes_channels_independently(rgb_image):
+    fig, ax = plt.subplots()
+    try:
+        img = plots.imshow(rgb_image, show_axis=False, ax=ax)
+        data = np.asarray(img.get_array())
+
+        assert data.shape == rgb_image.shape
+        # Matplotlib ignores the normalization for color data, so it has to be
+        # applied to the data itself, and independently for every channel
+        for i in range(3):
+            assert data[..., i].min() == pytest.approx(0, abs=1e-6)
+            assert data[..., i].max() == pytest.approx(1, abs=1e-6)
+    finally:
+        plt.close(fig)
+
+
+def test_imshow_rgb_respects_cuts(rgb_image):
+    fig, ax = plt.subplots()
+    try:
+        # Scalar cuts are broadcast onto all the channels, so only the brightest
+        # one should reach the top of the 0..1 range
+        img = plots.imshow(rgb_image, show_axis=False, ax=ax, vmin=0, vmax=1000)
+        data = np.asarray(img.get_array())
+
+        assert data[..., 0].max() < 0.1
+        assert data[..., 1].max() < 0.5
+        assert data[..., 2].max() == pytest.approx(1, abs=1e-6)
+
+        # Per-channel cuts are applied as is
+        img = plots.imshow(
+            rgb_image, show_axis=False, ax=ax, vmin=[0, 0, 0], vmax=[20, 200, 2000]
+        )
+        data = np.asarray(img.get_array())
+
+        for i in range(3):
+            assert data[..., i].max() < 0.9
+    finally:
+        plt.close(fig)
+
+
+def test_imshow_rgb_drops_colorbar(rgb_image):
+    fig, ax = plt.subplots()
+    try:
+        plots.imshow(rgb_image, show_colorbar=True, show_axis=False, ax=ax)
+        assert len(fig.axes) == 1
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        {},
+        {'stretch': 'asinh'},
+        {'stretch': 'histeq'},
+        {'r0': 1},
+        {'max_plot_size': 16},
+        {'xlim': (4, 20), 'ylim': (4, 20)},
+        {'qq': [1, 99]},
+    ],
+)
+def test_imshow_rgb_options(rgb_image, kwargs):
+    """All the processing options should work on color data, and keep it sane"""
+    for mask in [None, np.zeros((32, 32), dtype=bool), np.zeros((32, 32, 3), dtype=bool)]:
+        fig, ax = plt.subplots()
+        try:
+            img = plots.imshow(rgb_image, show_axis=False, ax=ax, mask=mask, **kwargs)
+            data = np.asarray(img.get_array())
+
+            assert data.shape[-1] == 3
+            assert np.all(np.isfinite(data))
+            assert data.min() >= 0 and data.max() <= 1
+        finally:
+            plt.close(fig)
+
+
+def test_imshow_rgba_keeps_alpha(rgb_image):
+    """Alpha channel should be passed through intact, and not normalized"""
+    image = np.concatenate([rgb_image, np.full((32, 32, 1), 0.25, np.float32)], axis=-1)
+
+    fig, ax = plt.subplots()
+    try:
+        img = plots.imshow(image, show_axis=False, ax=ax)
+        data = np.asarray(img.get_array())
+
+        assert data.shape[-1] == 4
+        assert np.allclose(data[..., 3], 0.25)
+    finally:
+        plt.close(fig)
+
+
+def test_imshow_rgb_integer_data():
+    """Integer color data is 0..255 and should survive the round trip intact"""
+    image = np.arange(256, dtype=np.uint8)[:, None, None].repeat(4, 1).repeat(3, 2)
+
+    fig, ax = plt.subplots()
+    try:
+        img = plots.imshow(image, show_axis=False, ax=ax, vmin=0, vmax=255)
+        data = np.asarray(img.get_array())
+
+        assert np.allclose(data[:, 0, 0] * 255, np.arange(256), atol=1e-3)
+    finally:
+        plt.close(fig)
+
+
+def test_imshow_rgb_non_finite():
+    """Non-finite color data should not reach Matplotlib"""
+    image = np.full((16, 16, 3), np.nan, dtype=np.float32)
+    image[0, 0] = [1.0, 2.0, 3.0]
+
+    fig, ax = plt.subplots()
+    try:
+        img = plots.imshow(image, show_axis=False, ax=ax)
+        assert np.all(np.isfinite(np.asarray(img.get_array())))
+
+        # Degenerate case with nothing to normalize at all
+        img = plots.imshow(np.full((16, 16, 3), np.nan), show_axis=False, ax=ax)
+        assert np.all(np.isfinite(np.asarray(img.get_array())))
+    finally:
+        plt.close(fig)
+
+
 def test_imshow_matches_matplotlib_extent():
     image = np.arange(12).reshape(3, 4)
 

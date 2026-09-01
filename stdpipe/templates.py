@@ -571,18 +571,86 @@ def point_in_ps1(ra, dec):
 
 
 # Legacy Survey images
-__ls_skycells = None
+# Data release the images and bricks are taken from
+ls_release = 'dr11'
+
+__ls_bricks = None
+__ls_brick_coords = None
+
+# Half-diagonal of a 0.25 deg Legacy Survey brick
+__ls_brick_radius = 0.25 * np.sqrt(2) / 2
+
+# Locally bundled DR11 brick table used by survey='ls11'
 __ls11_skycells = None
 
 
-def point_in_ls(ra, dec):
+def _get_ls_bricks():
     """
-    Whether the sky point is covered by Legacy Survey, rough estimation
+    Load (and cache in a global variable) the table of Legacy Survey bricks -
+    their names, centres, and the list of bands covered in every one of them.
     """
-    sc = SkyCoord(ra, dec, unit='deg')
-    res = np.abs(sc.galactic.b.deg) > 20
+    global __ls_bricks
 
-    return res
+    if __ls_bricks is None:
+        __ls_bricks = Table.read(
+            utils.get_data_path('legacysurvey_bricks.fits.gz'), format='fits'
+        )
+
+    return __ls_bricks
+
+
+def _get_ls_brick_coords():
+    """
+    Sky coordinates of Legacy Survey brick centres, cached in a global variable
+    so that the k-d tree built on the first positional match is re-used later.
+    """
+    global __ls_brick_coords
+
+    if __ls_brick_coords is None:
+        bricks = _get_ls_bricks()
+        __ls_brick_coords = SkyCoord(bricks['ra'], bricks['dec'], unit='deg')
+
+    return __ls_brick_coords
+
+
+def point_in_ls(ra, dec, band=None):
+    """
+    Whether the sky point is covered by Legacy Survey, rough estimation.
+
+    The point is checked against the actual list of survey bricks, so it also
+    handles the low Galactic latitude regions added to the footprint by the
+    DECam surveys (DES, DELVE, DeROSITA) included in DR11.
+
+    Parameters
+    ----------
+    ra, dec : float or array_like
+        Sky coordinates of the point(s), in degrees.
+    band : str, optional
+        If specified, additionally require the brick to be covered in this
+        photometric band. The northern part of the survey has no ``'i'`` band.
+
+    Returns
+    -------
+    bool or ndarray
+        Whether the point(s) are inside the survey footprint.
+    """
+    bricks = _get_ls_bricks()
+
+    sc = SkyCoord(ra, dec, unit='deg')
+
+    # The bricks tile the sky contiguously, so the point belongs to its nearest
+    # brick if it is closer than the brick half-diagonal
+    idx, sep, _ = sc.match_to_catalog_sky(_get_ls_brick_coords())
+
+    res = np.atleast_1d(sep.deg < __ls_brick_radius)
+
+    if band is not None:
+        # The brick the point belongs to should also be covered in this band
+        res &= np.array(
+            [band in _ for _ in bricks['bands'][np.atleast_1d(idx)]], dtype=bool
+        )
+
+    return bool(res[0]) if sc.isscalar else res
 
 
 def _filter_cells_by_footprint(cell_ra, cell_dec, cell_radius, wcs, width, height):
@@ -635,11 +703,13 @@ def find_skycells(
     ra, dec, sr : float
         Centre and radius (degrees) of the search region.
     band : str
-        Photometric band.
+        Photometric band. For Legacy Survey, the bricks that have no coverage
+        in this band are skipped (the northern part of it has no ``'i'`` band).
     ext : str
         ``'image'`` or ``'mask'``.
     survey : str
-        ``'ps1'``, ``'ls'`` (DR10 south + DR9 north), or ``'ls11'`` (DR11).
+        ``'ps1'``, ``'ls'`` (DR11), or ``'ls11'`` (DR11, using the locally
+        bundled brick table with north/south region fallback).
     wcs : `~astropy.wcs.WCS`, optional
         If provided together with *width*/*height*, used to reject
         cells that fall outside the actual rectangular image footprint
@@ -693,16 +763,11 @@ def find_skycells(
             results.append(url)
 
     elif survey in ('ls', 'ls11'):
-        global __ls_skycells, __ls11_skycells
-
         if survey == 'ls':
-            if __ls_skycells is None:
-                # Load skycells information and store to global variable
-                __ls_skycells = Table.read(
-                    utils.get_data_path('legacysurvey_bricks.fits.gz'), format='fits'
-                )
-            bricks = __ls_skycells
+            bricks = _get_ls_bricks()
         else:
+            global __ls11_skycells
+
             if __ls11_skycells is None:
                 # Load DR11 bricks information and store to global variable
                 __ls11_skycells = Table.read(
@@ -719,6 +784,15 @@ def find_skycells(
 
         candidates = bricks[idx]
 
+        # Masks are common for all the bands, images are not - so skip the
+        # bricks that have no coverage in the band we are interested in.
+        # The locally bundled 'ls11' brick table has no 'bands' column, so
+        # the filter only applies when the information is available.
+        if ext != 'mask' and band is not None and 'bands' in candidates.colnames:
+            candidates = candidates[
+                np.array([band in _ for _ in candidates['bands']], dtype=bool)
+            ]
+
         # Refine against actual rectangular footprint when WCS is available
         if wcs is not None and width is not None and height is not None:
             keep = _filter_cells_by_footprint(
@@ -734,7 +808,7 @@ def find_skycells(
         for cell in candidates:
             url = 'https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/'
             if survey == 'ls':
-                url += 'dr10/south/' if (cell['survey'] == 'S') else 'dr9/north/'
+                url += '%s/%s/' % (ls_release, 'south' if cell['survey'] == 'S' else 'north')
             else:
                 url += 'dr11/south/' if (cell['survey'] == 'S') else 'dr11/north/'
             url += 'coadd/%s/%s/' % (cell['brickname'][:3], cell['brickname'])
@@ -968,7 +1042,7 @@ def get_survey_image(
 
     Pan-STARRS images are converted from asinh scaling to linear flux.
     Pan-STARRS mask bits: https://outerspace.stsci.edu/display/PANSTARRS/PS1+Pixel+flags+in+Image+Table+Data
-    Legacy Survey mask bits: https://www.legacysurvey.org/dr10/bitmasks
+    Legacy Survey mask bits: https://www.legacysurvey.org/dr11/bitmasks
 
     Parameters
     ----------
@@ -978,7 +1052,8 @@ def get_survey_image(
         Data type: ``'image'`` or ``'mask'``.
     survey : str, optional
         Survey name: ``'ps1'`` for Pan-STARRS, ``'ls'`` for Legacy Survey
-        (DR10 south + DR9 north), or ``'ls11'`` for Legacy Survey DR11.
+        (DR11), or ``'ls11'`` for Legacy Survey DR11 using the locally
+        bundled brick table (with north/south region fallback).
     wcs : astropy.wcs.WCS, optional
         Output WCS projection.
     shape : tuple of int, optional
