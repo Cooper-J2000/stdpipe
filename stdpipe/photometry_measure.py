@@ -99,10 +99,39 @@ def _extract_valid_positions(obj):
     valid_pos : ndarray of bool
         True where both x and y are finite.
     """
-    x_vals = np.ma.filled(np.asarray(obj['x']), fill_value=np.nan)
-    y_vals = np.ma.filled(np.asarray(obj['y']), fill_value=np.nan)
+    # np.asarray() would silently drop the mask of MaskedColumn
+    x_vals = np.ma.filled(np.ma.asarray(obj['x'], dtype=float), fill_value=np.nan)
+    y_vals = np.ma.filled(np.ma.asarray(obj['y'], dtype=float), fill_value=np.nan)
     valid_pos = np.isfinite(x_vals) & np.isfinite(y_vals)
     return x_vals, y_vals, valid_pos
+
+
+def _store_fitted_positions(obj, x_fit, y_fit, keep_orig=True):
+    """Store positions refined by the fit in ``x``/``y`` columns.
+
+    Follows the centroiding convention: input positions are preserved in
+    ``x_orig``/``y_orig`` (unless ``keep_orig`` is False, e.g. when they are
+    already stored there by the preceding centroiding step), and objects
+    without finite fitted position keep their input one.
+
+    Parameters
+    ----------
+    obj : astropy.table.Table
+        Table with 'x' and 'y' columns, modified in place.
+    x_fit, y_fit : array-like
+        Fitted positions for all rows of the table, NaN where not fitted.
+    keep_orig : bool
+        Whether to store input positions in ``x_orig``/``y_orig`` columns.
+    """
+    if keep_orig:
+        obj['x_orig'] = obj['x'].copy()
+        obj['y_orig'] = obj['y'].copy()
+
+    x_fit = np.asarray(x_fit, dtype=float)
+    y_fit = np.asarray(y_fit, dtype=float)
+    good = np.isfinite(x_fit) & np.isfinite(y_fit)
+    obj['x'][good] = x_fit[good]
+    obj['y'][good] = y_fit[good]
 
 
 def _prepare_image_and_mask(image, mask):
@@ -983,15 +1012,14 @@ def measure_objects(
             )
 
         # Keep original pixel positions
-        obj['x_orig'] = np.array(obj['x'])
-        obj['y_orig'] = np.array(obj['y'])
+        obj['x_orig'] = obj['x'].copy()
+        obj['y_orig'] = obj['y'].copy()
 
         # Combined mask for centroiding
         centroid_mask = mask | mask0
 
         # Get plain arrays to avoid MaskedColumn warnings
-        xs = np.array(obj['x'], dtype=float)
-        ys = np.array(obj['y'], dtype=float)
+        xs, ys, _ = _extract_valid_positions(obj)
 
         # Process each object individually
         for i in range(len(obj)):
@@ -1350,8 +1378,7 @@ def _get_sep_psf(psf, fwhm, log):
             'Converting PSFEx model to sep.PSF (FWHM=%.2f, sampling=%.3f, degree=%d)'
             % (psf['fwhm'], psf['sampling'], psf.get('degree', 0))
         )
-        sep_psf = sep.PSF(
-            psf['data'],
+        kwargs = dict(
             sampling=psf['sampling'],
             degree=psf.get('degree', 0),
             x0=psf.get('x0', 0),
@@ -1360,7 +1387,19 @@ def _get_sep_psf(psf, fwhm, log):
             sy=psf.get('sy', 1),
             fwhm=psf['fwhm'],
         )
-        return sep_psf
+        # Point samples of the pixel-integrated PSF (PSFEx, create_psf_model)
+        # must be interpolated, not integrated over image pixels once more
+        sampled = psf.get('subpixel_integrated', None) is False and psf['sampling'] < 1
+        if sampled:
+            try:
+                return sep.PSF(psf['data'], sampled=True, **kwargs)
+            except TypeError:
+                log(
+                    'Warning: this SEP version does not support point-sampled '
+                    'supersampled PSF models, fluxes may be biased'
+                )
+
+        return sep.PSF(psf['data'], **kwargs)
 
     raise TypeError("Unsupported PSF type: %s. Expected sep.PSF or PSFEx dict." % type(psf))
 
@@ -1492,9 +1531,13 @@ def measure_objects_sep(
     -------
     obj : astropy.table.Table
         Copy of table with ``flux``, ``fluxerr``, ``mag`` and ``magerr``
-        columns from SEP measurements. When ``psf`` is provided, also
-        includes ``x_psf``, ``y_psf`` (fitted positions), ``chi2_psf``,
-        ``niter_psf``, and ``flags_psf`` columns.
+        columns from SEP measurements, and ``bg_fluxerr`` (noise of the
+        global background model inside the aperture, 0 if both ``bg`` and
+        ``err`` are provided). When ``psf`` is provided, also
+        includes ``chi2_psf``, ``niter_psf``, and ``flags_psf`` columns.
+        Positions refined by centroiding or PSF fitting (with
+        ``fit_positions=True``) replace ``x``, ``y``, and the input ones are
+        kept in ``x_orig``, ``y_orig``.
     bg_image : ndarray
         Background image (only returned if ``get_bg=True``).
     err_image : ndarray
@@ -1604,8 +1647,8 @@ def measure_objects_sep(
             log('Using SEP Gaussian windowed centroiding (maxstep=%.2f pix)' % maxstep)
 
         # Keep original pixel positions
-        obj['x_orig'] = np.array(obj['x'])
-        obj['y_orig'] = np.array(obj['y'])
+        obj['x_orig'] = obj['x'].copy()
+        obj['y_orig'] = obj['y'].copy()
 
         x_vals, y_vals, valid_pos = _extract_valid_positions(obj)
 
@@ -1663,6 +1706,7 @@ def measure_objects_sep(
 
     obj['flux'] = np.nan
     obj['fluxerr'] = np.nan
+    obj['bg_fluxerr'] = 0.0  # Local background flux error inside the aperture
 
     if np.any(valid_pos):
         # Evaluate FWHM at the valid source positions. For a callable
@@ -1679,6 +1723,17 @@ def measure_objects_sep(
             aper_arr = aper * fwhm_at_pos
         else:
             aper_arr = aper_pix
+
+        # Position-dependent background flux error from global background
+        # model, if available - same definition as in measure_objects()
+        if bg_est is not None:
+            res, _, _ = sep.sum_circle(
+                np.ascontiguousarray(bg_est_rms**2),
+                x_vals[valid_pos],
+                y_vals[valid_pos],
+                aper_arr,
+            )
+            obj['bg_fluxerr'][valid_pos] = np.sqrt(res)
 
         # Prepare bkgann in pixels.
         bkgann_pix = None
@@ -1728,12 +1783,6 @@ def measure_objects_sep(
             obj['flux'][valid_pos] = flux
             obj['fluxerr'][valid_pos] = fluxerr
 
-            # Store fitted positions
-            obj['x_psf'] = np.nan
-            obj['y_psf'] = np.nan
-            obj['x_psf'][valid_pos] = xfit
-            obj['y_psf'][valid_pos] = yfit
-
             # Store PSF fit quality metrics
             obj['chi2_psf'] = np.nan
             obj['chi2_psf'][valid_pos] = chi2
@@ -1753,6 +1802,15 @@ def measure_objects_sep(
                 dy_fit = yfit - y_vals[valid_pos]
                 large_shift = (dx_fit**2 + dy_fit**2) > 1.0
                 obj['flags'][np.where(valid_pos)[0][large_shift]] |= 0x2000
+
+                # Store fitted positions, keeping the ones before centroiding
+                x_fit = np.full(len(obj), np.nan)
+                y_fit = np.full(len(obj), np.nan)
+                x_fit[valid_pos] = xfit
+                y_fit[valid_pos] = yfit
+                # Failed fits keep their input positions
+                x_fit[~np.isfinite(obj['flux'])] = np.nan
+                _store_fitted_positions(obj, x_fit, y_fit, keep_orig=not centroid_iter)
 
         elif optimal:
             # Optimal extraction using SEP with built-in background handling

@@ -23,6 +23,11 @@ from .photometry_measure import _is_callable_fwhm, _fwhm_median
 # Re-export for backward compatibility
 from .psf import create_psf_model
 
+# photutils PSFPhotometry flag for possible non-convergence (maxfev reached).
+# Bit 1 means only that the fit region was smaller than fit_shape, due to
+# masked pixels or image edges, and does not invalidate the fit.
+_PHOTUTILS_FLAG_NONCONVERGED = 8
+
 
 def _odd_int(value, min_value=1):
     value = int(np.round(value))
@@ -463,7 +468,7 @@ def measure_objects_psf(
     sn=None,
     fit_shape='circular',
     fit_size=None,
-    maxiters=3,
+    maxiters=100,
     recentroid=True,
     keep_negative=True,
     get_bg=False,
@@ -539,7 +544,10 @@ def measure_objects_psf(
     fit_size : int or None, optional
         Size of fitting region in pixels. If None, defaults to psf_size.
     maxiters : int, optional
-        Maximum number of iterations for PSF fitting.
+        Maximum number of model evaluations of the least-squares fitter (it
+        is passed to scipy as ``maxfev``), per source or group. Each fitting
+        step needs several evaluations to estimate the Jacobian, so too
+        small values stop the fit before convergence.
     recentroid : bool, optional
         If True, allow PSF position to vary during fitting (recommended).
     keep_negative : bool, optional
@@ -571,8 +579,10 @@ def measure_objects_psf(
     Returns
     -------
     result : `~astropy.table.Table` or tuple
-        Copy of original table with ``flux``, ``fluxerr``, ``mag``, ``magerr``,
-        ``x_psf``, ``y_psf`` columns from PSF fitting. Also includes quality of
+        Copy of original table with ``flux``, ``fluxerr``, ``mag``, ``magerr``
+        columns from PSF fitting. With ``recentroid=True``, fitted positions
+        of successful fits replace ``x``, ``y``, and the input ones are kept in
+        ``x_orig``, ``y_orig``. Also includes quality of
         fit columns: ``qfit_psf`` (fit quality, 0=good), ``cfit_psf`` (central
         pixel fit quality), ``flags_psf`` (photutils fit flags), ``npix_psf``
         (number of unmasked pixels used in fit), and ``reduced_chi2_psf``
@@ -595,6 +605,7 @@ def measure_objects_psf(
         _prepare_image_and_mask,
         _extract_valid_positions,
         _compute_magnitudes_and_filter,
+        _store_fitted_positions,
     )
 
     image1, mask0, mask = _prepare_image_and_mask(image, mask)
@@ -706,14 +717,16 @@ def measure_objects_psf(
                 log('Using PSFEx/ePSF PSF model (constant across field)')
             # Evaluate at the polynomial zero-point (~field centre); (0, 0)
             # would extrapolate a varying model to the image corner
-            psf_image = psf_module.get_supersampled_psf_stamp(
-                psf, x=psf.get('x0', 0), y=psf.get('y0', 0), normalize=True
+            psf_image, psf_origin = psf_module._get_sampled_psf_stamp(
+                psf, x=psf.get('x0', 0), y=psf.get('y0', 0)
             )
 
             # Handle oversampling if needed
             oversampling = _compute_oversampling(psf_sampling)
             psf_image = _scale_psf_image_for_photutils(psf_image, oversampling)
-            psf_model = photutils.psf.ImagePSF(psf_image, oversampling=oversampling)
+            psf_model = photutils.psf.ImagePSF(
+                psf_image, oversampling=oversampling, origin=psf_origin
+            )
             psf_is_position_dependent = False
 
             if psf_size is None:
@@ -758,7 +771,7 @@ def measure_objects_psf(
 
     # Add initial flux guesses if available
     if 'flux' in obj.colnames:
-        flux0 = np.ma.filled(np.asarray(obj['flux'], dtype=float), fill_value=np.nan)
+        flux0 = np.ma.filled(np.ma.asarray(obj['flux'], dtype=float), fill_value=np.nan)
         # A non-finite initial flux poisons the fit of the source (and, in
         # grouped mode, of its whole group) — fall back to a finite guess
         bad0 = ~np.isfinite(flux0)
@@ -799,7 +812,7 @@ def measure_objects_psf(
     # Perform PSF photometry
     log('Performing PSF photometry on %d objects (%d valid)' % (len(obj), np.sum(valid_pos)))
     log(
-        'Settings: %d iterations, recentroid=%s, grouped=%s, position_dependent=%s'
+        'Settings: %d max evaluations, recentroid=%s, grouped=%s, position_dependent=%s'
         % (maxiters, recentroid, group_sources, psf_is_position_dependent)
     )
 
@@ -809,8 +822,8 @@ def measure_objects_psf(
         # Initialize output columns
         obj['flux'] = np.nan
         obj['fluxerr'] = np.nan
-        obj['x_psf'] = obj['x']
-        obj['y_psf'] = obj['y']
+        obj['x_psf'] = x_vals
+        obj['y_psf'] = y_vals
         obj['qfit_psf'] = np.nan
         obj['cfit_psf'] = np.nan
         obj['flags_psf'] = 0
@@ -861,16 +874,17 @@ def measure_objects_psf(
             try:
                 # Evaluate PSF at the group mean position (the PSF varies
                 # smoothly on the scale of a group)
-                psf_image = psf_module.get_supersampled_psf_stamp(
+                psf_image, psf_origin = psf_module._get_sampled_psf_stamp(
                     psf_model,
                     x=float(np.mean(xv[in_group])),
                     y=float(np.mean(yv[in_group])),
-                    normalize=True,
                 )
                 psf_image = _scale_psf_image_for_photutils(psf_image, oversampling)
 
                 # Create photutils PSF model for this group position
-                psf_at_pos = photutils.psf.ImagePSF(psf_image, oversampling=oversampling)
+                psf_at_pos = photutils.psf.ImagePSF(
+                    psf_image, oversampling=oversampling, origin=psf_origin
+                )
 
                 # Set up photometry for this group
                 phot_group = photutils.psf.PSFPhotometry(
@@ -919,20 +933,19 @@ def measure_objects_psf(
                         obj['flags'][i] |= 0x1000
                     # Also flag if fit didn't converge or returned input unchanged
                     elif 'flags' in result_group.colnames:
-                        # Check bit 0 (convergence failure)
-                        bit0_set = (result_group['flags'][row] & 1) != 0
+                        # Possible non-convergence reported by photutils
+                        unconverged = (
+                            result_group['flags'][row] & _PHOTUTILS_FLAG_NONCONVERGED
+                        ) != 0
 
-                        # Check for exact match with input when photutils claims it converged
-                        # (bit 0 NOT set). This catches cases where photutils returns input
-                        # unchanged but doesn't set bit 0.
-                        converged_but_unchanged = (
-                            (result_group['flags'][row] & 1) == 0
-                            and obj['flux'][i] == init_group['flux'][row]
+                        # Fit returned the input unchanged without reporting it
+                        unchanged = (
+                            obj['flux'][i] == init_group['flux'][row]
                             and obj['x_psf'][i] == init_group['x'][row]
                             and obj['y_psf'][i] == init_group['y'][row]
                         )
 
-                        if bit0_set or converged_but_unchanged:
+                        if unconverged or unchanged:
                             log(
                                 'Warning: PSF fit did not converge or returned unchanged parameters for object %d, setting flux to NaN'
                                 % i
@@ -964,8 +977,8 @@ def measure_objects_psf(
         # Initialize output columns with NaN (for invalid positions)
         obj['flux'] = np.nan
         obj['fluxerr'] = np.nan
-        obj['x_psf'] = np.ma.filled(np.asarray(obj['x']), fill_value=np.nan)
-        obj['y_psf'] = np.ma.filled(np.asarray(obj['y']), fill_value=np.nan)
+        obj['x_psf'] = x_vals
+        obj['y_psf'] = y_vals
         obj['qfit_psf'] = np.nan
         obj['cfit_psf'] = np.nan
         obj['flags_psf'] = 0
@@ -1078,26 +1091,22 @@ def measure_objects_psf(
                         obj['spread_model'][valid_pos] = quality['spread_model']
                         obj['dspread_model'][valid_pos] = quality['dspread_model']
 
-                # Flag fits that didn't converge (photutils returns initial guess unchanged)
-                # Check for flags_psf bit 0 (convergence failure) or exact match with input
+                # Flag fits that didn't converge, or returned the initial guess unchanged
                 if 'flags_psf' in obj.colnames and 'flux' in init_params.colnames:
-                    # Photutils flags: bit 0 = fit did not converge
-                    # When fit doesn't converge, photutils returns initial parameters unchanged
-                    unconverged = valid_pos & ((obj['flags_psf'] & 1) != 0)
+                    unconverged = valid_pos & (
+                        (obj['flags_psf'] & _PHOTUTILS_FLAG_NONCONVERGED) != 0
+                    )
 
-                    # Also check for exact byte-level match between input and output when photutils
-                    # claims the fit converged (bit 0 NOT set). This catches cases where photutils
-                    # returns input unchanged but doesn't set bit 0.
-                    converged_but_unchanged = (
+                    # photutils may return input unchanged without reporting it
+                    unchanged = (
                         valid_pos
-                        & ((obj['flags_psf'] & 1) == 0)
                         & (obj['flux'] == init_params['flux'])
                         & (obj['x_psf'] == init_params['x'])
                         & (obj['y_psf'] == init_params['y'])
                     )
 
                     # Combine both conditions
-                    failed = unconverged | converged_but_unchanged
+                    failed = unconverged | unchanged
 
                     if np.sum(failed) > 0:
                         log(
@@ -1112,6 +1121,17 @@ def measure_objects_psf(
                 log('PSF photometry failed: %s' % str(e))
                 log('Falling back to NaN values')
                 obj['flags'][valid_pos] |= 0x1000
+
+    # Fitted positions replace the input ones (kept in x_orig/y_orig), except
+    # for failed fits
+    if recentroid:
+        fitted = np.isfinite(np.asarray(obj['flux'], dtype=float))
+        _store_fitted_positions(
+            obj,
+            np.where(fitted, obj['x_psf'], np.nan),
+            np.where(fitted, obj['y_psf'], np.nan),
+        )
+    obj.remove_columns(['x_psf', 'y_psf'])
 
     obj = _compute_magnitudes_and_filter(obj, sn, keep_negative, log)
 

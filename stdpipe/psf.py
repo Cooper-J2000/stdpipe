@@ -3,11 +3,11 @@ Module for working with point-spread function (PSF) models
 """
 
 import os, shutil, tempfile, shlex
+import warnings
 import numpy as np
 
 from astropy.io import fits
 from astropy.table import Table
-from astropy.nddata import NDData
 
 from scipy import ndimage
 
@@ -344,6 +344,8 @@ def load_psf(filename, get_header=False, verbose=False):
         'sx': header.get('POLSCAL1', 1),
         'y0': header.get('POLZERO2', 0),
         'sy': header.get('POLSCAL2', 1),
+        # PSFEx samples the pixel-integrated PSF, it doesn't integrate over sub-pixels
+        'subpixel_integrated': False,
     }
 
     if get_header:
@@ -435,6 +437,61 @@ def get_supersampled_psf_stamp(psf, x=0, y=0, normalize=True):
     return stamp
 
 
+def _psf_center(psf, shape):
+    """Center ``(x, y)`` of supersampled PSF model grid of a given shape.
+
+    Point-sampled models (PSFEx convention) have their center at pixel
+    ``size // 2`` also for even sizes, while sub-pixel integrated ones
+    (and models without declared convention) at ``(size - 1) / 2``.
+    """
+
+    h, w = shape
+    if psf.get('subpixel_integrated', None) is False:
+        return float(w // 2), float(h // 2)
+    return (w - 1) / 2.0, (h - 1) / 2.0
+
+
+def _get_sampled_psf_stamp(psf, x=0, y=0):
+    """Supersampled PSF stamp as point samples of the pixel-integrated PSF.
+
+    Sub-pixel integrated models are converted by integrating, for every
+    model pixel, the flux over the image pixel centered on it. The cumulative
+    flux is known exactly at model pixel edges, and is interpolated with a
+    cubic spline where image pixel edges fall inside model pixels (even
+    oversampling factors). Returns the stamp normalized to unit sum, and its
+    center ``(x, y)``.
+    """
+
+    from scipy.interpolate import CubicSpline
+
+    stamp = get_supersampled_psf_stamp(psf, x, y, normalize=True)
+    center = _psf_center(psf, stamp.shape)
+
+    N = int(round(1.0 / psf['sampling']))
+    if (
+        psf.get('subpixel_integrated', False)
+        and N > 1
+        and np.isclose(N * psf['sampling'], 1.0, rtol=1e-3, atol=0)
+    ):
+        for axis in (0, 1):
+            n = stamp.shape[axis]
+            # Cumulative flux at model pixel edges 0..n
+            shape = list(stamp.shape)
+            shape[axis] = 1
+            cumul = np.concatenate([np.zeros(shape), np.cumsum(stamp, axis=axis)], axis=axis)
+            spline = CubicSpline(np.arange(n + 1), cumul, axis=axis)
+            # Image pixel centered on model pixel k spans k + 0.5 -+ N / 2 in edge coordinates
+            centers = np.arange(n) + 0.5
+            lo = np.clip(centers - N / 2, 0, n)
+            hi = np.clip(centers + N / 2, 0, n)
+            stamp = spline(hi) - spline(lo)
+        total = np.sum(stamp)
+        if np.isfinite(total) and total > 0:
+            stamp /= total
+
+    return stamp, center
+
+
 def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     """Returns PSF stamp in original image pixel space with sub-pixel shift applied.
 
@@ -455,6 +512,17 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
 
     The stamp should directly represent stellar shape at a given position (including sub-pixel
     center shift) inside the image.
+
+    Supersampled model pixels are interpreted according to the
+    ``psf['subpixel_integrated']`` key. If True, every model pixel holds the
+    flux integrated over its own (sub-pixel) area, and image pixels are
+    obtained by summing blocks of them. If False, model pixels are point
+    samples of the PSF already integrated over image pixels (PSFEx and
+    :func:`stdpipe.psf.create_psf_model` convention), and image pixels are
+    obtained by interpolation. If the key is missing, block summing is used
+    whenever the model size is a multiple of an integer oversampling factor.
+    The center of point-sampled models of even size is at pixel ``size // 2``
+    (PSFEx convention), otherwise at ``(size - 1) / 2``.
 
     Parameters
     ----------
@@ -491,7 +559,8 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     N = int(round(1.0 / psf['sampling']))
 
     if (
-        N > 1
+        psf.get('subpixel_integrated', True)
+        and N > 1
         # Block-summing N x N subpixels assumes each subpixel is exactly 1/N
         # image pixels; a non-integer 1/sampling (e.g. PSFEx PSF_SAMP=0.53)
         # would silently rescale the PSF by sampling*N
@@ -522,8 +591,7 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
         stamp = shifted[: out_h * N, : out_w * N].reshape(out_h, N, out_w, N).sum(axis=(1, 3))
     else:
         # Fallback for non-integer oversampling or oversampling=1
-        ssx0 = (supersampled.shape[1] - 1) / 2.0
-        ssy0 = (supersampled.shape[0] - 1) / 2.0
+        ssx0, ssy0 = _psf_center(psf, supersampled.shape)
 
         x0 = np.floor(psf['width'] * psf['sampling'] / 2)
         y0 = np.floor(psf['height'] * psf['sampling'] / 2)
@@ -604,6 +672,74 @@ def place_psf_stamp(image, psf, x0, y0, flux=1, gain=None):
     image[y1[idx], x1[idx]] += stamp[y[idx], x[idx]]
 
 
+def _estimate_psf_stamp_size(image, obj, fwhm, mask=None, log=None, nstars=100, snr=3.0):
+    """Estimate PSF stamp size from the extent of significant stellar wings.
+
+    Stacks radial profiles of the brightest stars, normalized by their core
+    flux, and returns an odd size covering the radius where the median
+    profile stops being significant, bounded by ``max(15, 5 * fwhm)`` and
+    ``10 * fwhm``.
+    """
+
+    min_size = max(15, int(np.ceil(5 * fwhm)))
+    max_size = max(min_size, int(np.ceil(10 * fwhm)))
+    min_size += 1 - min_size % 2
+    max_size += 1 - max_size % 2
+    half = max_size // 2
+
+    x = np.asarray(obj['x'], dtype=np.float64)
+    y = np.asarray(obj['y'], dtype=np.float64)
+    ok = np.isfinite(x) & np.isfinite(y)
+    ok &= (x >= half) & (x < image.shape[1] - half - 1) & (y >= half) & (y < image.shape[0] - half - 1)
+    idx = np.flatnonzero(ok)
+    if 'flux' in obj.colnames:
+        idx = idx[np.argsort(-np.asarray(obj['flux'], dtype=np.float64)[idx])]
+    idx = idx[:nstars]
+    if len(idx) < 5:
+        return min_size
+
+    yy, xx = np.mgrid[-half : half + 1, -half : half + 1]
+    radii, values = [], []
+    for i in idx:
+        ix, iy = int(np.round(x[i])), int(np.round(y[i]))
+        cutout = image[iy - half : iy + half + 1, ix - half : ix + half + 1].astype(np.float64)
+        valid = np.isfinite(cutout)
+        if mask is not None:
+            valid &= ~mask[iy - half : iy + half + 1, ix - half : ix + half + 1]
+        r = np.hypot(xx + ix - x[i], yy + iy - y[i])
+        border = valid & (r > half - 1)
+        if not np.any(border):
+            continue
+        cutout = cutout - np.median(cutout[border])
+        core = np.sum(cutout[valid & (r < 1.5 * fwhm)])
+        if not np.isfinite(core) or core <= 0:
+            continue
+        radii.append(r[valid])
+        values.append(cutout[valid] / core)
+
+    if len(radii) < 5:
+        return min_size
+
+    radii = np.concatenate(radii)
+    values = np.concatenate(values)
+    ibin = np.floor(radii / 0.5).astype(int)
+    med, scale, count = _group_robust_stats(ibin, values, int(ibin.max()) + 1)
+    centers = (np.arange(len(med)) + 0.5) * 0.5
+    with np.errstate(invalid='ignore', divide='ignore'):
+        err = 1.2533 * scale / np.sqrt(count)
+    faint = (centers > 1.25 * fwhm) & (count >= 5) & ~(med > snr * err)
+    radius = centers[np.argmax(faint)] if np.any(faint) else half
+
+    size = int(np.clip(2 * int(np.ceil(radius)) + 1, min_size, max_size))
+    if log is not None:
+        log(
+            'Stacked profile of %d stars significant up to %.1f px, stamp size %d'
+            % (len(idx), radius, size)
+        )
+
+    return size
+
+
 def create_psf_model(
     image,
     obj=None,
@@ -617,18 +753,19 @@ def create_psf_model(
     neighbors_obj=None,
     subtract_background=False,
     isolation=2.0,
+    maxiters=5,
+    max_degree=3,
     get_raw=False,
     verbose=False,
 ):
     """
     Create an empirical PSF (ePSF) model from stars in the image.
 
-    For ``degree=0`` (default), builds a position-invariant ePSF using
-    photutils ``EPSFBuilder`` (iterative recentering and stacking).
-
-    For ``degree > 0``, builds a position-dependent PSF model by fitting
-    per-pixel polynomial coefficients to resampled star stamps, following
-    the same approach as PSFEx. The polynomial model is:
+    Star pixels are placed onto an oversampled grid at their true sub-pixel
+    offsets from the star centers (Anderson & King 2000 ePSF approach), and
+    per-pixel polynomial coefficients are fitted to them, similarly to PSFEx.
+    For ``degree=0`` (default) the model is position-invariant, i.e. a
+    weighted mean of the stars; for ``degree > 0`` it is position-dependent:
 
     .. math::
 
@@ -636,6 +773,14 @@ def create_psf_model(
 
     where ``(dx, dy)`` are normalized image coordinates and ``(p1_k, p2_k)``
     are polynomial exponents with ``p1_k + p2_k <= degree``.
+
+    The fit is iterated: every star is fitted with the current model for a
+    sub-pixel shift and an amplitude, then its pixels are placed again at the
+    refined center and normalized by the fitted amplitude. Outliers are
+    rejected both per star and per pixel, so that a star with a local defect
+    (cosmic ray, poorly subtracted neighbour) still contributes its clean
+    pixels. Outer model pixels where the stacked profile is not significant
+    are smoothly tapered to zero.
 
     The returned dictionary structure is compatible with PSFEx output from
     :func:`stdpipe.psf.run_psfex` and can be used with the same evaluation
@@ -651,23 +796,34 @@ def create_psf_model(
     fwhm : float, optional
         Approximate FWHM of stars in pixels. If None, will be estimated.
     size : int, optional
-        Size of cutouts to extract around stars (should be odd). If None, automatically
-        determined from FWHM as ``max(15, round_up_to_odd(5 * fwhm))``.
+        Size of cutouts to extract around stars (should be odd). If None, it is
+        determined from the radius where the stacked radial profile of the
+        brightest stars stops being significant, between
+        ``max(15, 5 * fwhm)`` and ``10 * fwhm`` (rounded up to odd).
     mask : numpy.ndarray, optional
         Image mask as a boolean array (True values will be masked).
     oversampling : int, optional
         Oversampling factor for the ePSF. If None (default), it is auto-selected from
         the FWHM: ``1`` when ``fwhm >= 2.5`` image pixels (well-sampled PSF) and
         ``2`` otherwise (under-sampled PSF). Pass an explicit integer to override.
-    degree : int, optional
+    degree : int or 'auto', optional
         Polynomial degree for spatial PSF variation (default: 0 = constant). Degree 1 =
-        linear (3 coefficients), degree 2 = quadratic (6 coefficients), etc.
+        linear (3 coefficients), degree 2 = quadratic (6 coefficients), etc. If
+        ``'auto'``, the degree (up to ``max_degree``, and to what the number of
+        stars supports at 5 stars per coefficient) is selected by spatial
+        cross-validation: the lowest degree predicting the shapes of stars left
+        out of the fit not worse than the best one by more than one standard
+        error. Per-degree scores are then stored in ``degree_selection`` entry
+        of the returned dictionary. The choice is conservative: on simulated
+        fields it picks the lower of two nearly equivalent degrees (at most
+        ~0.2% rms PSF flux accuracy lost), while never selecting degrees that
+        the data cannot constrain.
     regularization : float, optional
         Tikhonov regularization parameter for polynomial fitting (default: 1e-6). Only used
         when ``degree > 0``. Set to 0 for unregularized least-squares.
     subtract_neighbors : bool, optional
         If True (default), subtract estimated flux from neighboring stars before extracting
-        cutouts. Reduces contamination in crowded fields. Only used when ``degree > 0``.
+        cutouts. Reduces contamination in crowded fields.
     neighbors_obj : astropy.table.Table, optional
         Full detection catalogue (with 'x', 'y', 'flux' columns) used to model
         neighbour contamination when ``subtract_neighbors=True``. If None, the
@@ -679,7 +835,7 @@ def create_psf_model(
         Local background handling for each training stamp before normalization. ``False`` or
         ``'none'`` leaves the current image values unchanged, ``True`` or ``'median'``
         subtracts the median of the stamp border, and ``'plane'`` fits and subtracts a
-        tilted background plane from the border pixels. Only used when ``degree > 0``.
+        tilted background plane from the border pixels.
         When building from the raw image instead of a background-subtracted one,
         ``'plane'`` is usually the most robust choice.
     isolation : float, optional
@@ -687,9 +843,16 @@ def create_psf_model(
         (default: 2.0). Stars with a neighbor closer than ``isolation * fwhm`` are excluded.
         Combined with ``subtract_neighbors=True``, the lower default value works in both
         sparse and dense fields. Set to 0 or None to disable isolation filtering.
+    maxiters : int, optional
+        Maximal number of iterations refining star centers and normalizations
+        (default: 5). Iterations stop earlier once the RMS center correction
+        is below 0.005 pixels. Set to 0 to build the model in a single pass at
+        catalogue positions, with stamps normalized by their sums.
+    max_degree : int, optional
+        Highest polynomial degree considered when ``degree='auto'`` (default: 3).
     get_raw : bool, optional
-        If True and ``degree=0``, returns raw photutils EPSFModel object. Ignored when
-        ``degree > 0``.
+        If True and ``degree=0``, returns the model as photutils ``ImagePSF``
+        object. Ignored when ``degree > 0``.
     verbose : bool or callable, optional
         Whether to show verbose messages.
 
@@ -726,11 +889,6 @@ def create_psf_model(
                 fwhm = 3.0
                 log('FWHM not available, using default: %.2f pixels' % fwhm)
 
-        if size is None:
-            size = max(15, int(np.ceil(5 * fwhm)))
-        if size % 2 == 0:
-            size += 1
-
         flux_median = np.median(obj['flux'])
         # np.std is inflated by the bright tail, so a median + N*std upper
         # bound lets saturated stars through; cut the brightest few percent
@@ -740,7 +898,7 @@ def create_psf_model(
         # Select stars with flux within reasonable range
         idx = (obj['flux'] > flux_median) & (obj['flux'] < flux_upper)
         # Remove edge objects
-        edge = size
+        edge = size if size is not None else max(15, int(np.ceil(5 * fwhm)))
         idx &= (obj['x'] > edge) & (obj['x'] < image.shape[1] - edge)
         idx &= (obj['y'] > edge) & (obj['y'] < image.shape[0] - edge)
         # Remove flagged objects
@@ -757,16 +915,6 @@ def create_psf_model(
         else:
             fwhm = 3.0
             log('FWHM not available, using default: %.2f pixels' % fwhm)
-
-    # Auto-size stamps based on FWHM if not specified.
-    # 5*FWHM keeps the stamp small enough to be cheap in sep.psf_fit while
-    # still covering ~3-sigma of the PSF wings. The 8*FWHM legacy default
-    # over-extends in dense fields (large fit groups, slow rendering).
-    if size is None:
-        size = max(15, int(np.ceil(5 * fwhm)))
-    if size % 2 == 0:
-        size += 1  # Make sure size is odd
-    log('Using stamp size: %d pixels (FWHM=%.1f)' % (size, fwhm))
 
     # Auto-pick oversampling from FWHM if not explicitly set.
     # FWHM >= 2.5 image pixels is well-sampled enough that oversampling=1 is
@@ -804,120 +952,103 @@ def create_psf_model(
                 'using %d most isolated instead' % (len(isolated), min_dist, len(obj))
             )
 
+    # Auto-size stamps from the extent of significant PSF wings: a model
+    # truncated while still carrying flux loses a sub-pixel phase dependent
+    # part of it when shifted, and underestimates total fluxes
+    if size is None:
+        size = _estimate_psf_stamp_size(image, obj, fwhm, mask, log)
+    if size % 2 == 0:
+        size += 1  # Make sure size is odd
+    log('Using stamp size: %d pixels (FWHM=%.1f)' % (size, fwhm))
+
     background_mode = _normalize_stamp_background_mode(subtract_background)
 
-    if degree == 0:
-        if background_mode != 'none':
-            log('Ignoring local stamp background mode for position-invariant ePSF builder')
-        return _create_psf_model_constant(
-            image, obj, fwhm, size, mask, oversampling, get_raw, verbose, log
-        )
-    else:
-        return _create_psf_model_polynomial(
+    psf = _create_psf_model_polynomial(
+        image,
+        obj,
+        fwhm,
+        size,
+        mask,
+        oversampling,
+        None if degree == 'auto' else degree,
+        regularization,
+        subtract_neighbors,
+        neighbors_obj if neighbors_obj is not None else obj,
+        background_mode,
+        maxiters,
+        log,
+        max_degree=max_degree,
+    )
+
+    selection = psf.get('degree_selection')
+    if selection is not None and psf['degree'] != selection['registration_degree']:
+        # Star centers and normalizations were refined with the highest
+        # candidate degree model; rebuild the chosen one from scratch so that
+        # it is identical to an explicit build with that degree
+        log('Rebuilding PSF model with selected degree %d' % psf['degree'])
+        psf = _create_psf_model_polynomial(
             image,
             obj,
             fwhm,
             size,
             mask,
             oversampling,
-            degree,
+            psf['degree'],
             regularization,
             subtract_neighbors,
             neighbors_obj if neighbors_obj is not None else obj,
             background_mode,
+            maxiters,
             log,
         )
+        psf['degree_selection'] = selection
 
-
-def _create_psf_model_constant(image, obj, fwhm, size, mask, oversampling, get_raw, verbose, log):
-    """Build position-invariant ePSF using photutils EPSFBuilder."""
-
-    log('Extracting %dx%d cutouts around %d stars' % (size, size, len(obj)))
-
-    nddata = NDData(data=image, mask=mask)
-
-    # Extract stars using photutils
-    stars = photutils.psf.extract_stars(nddata, Table({'x': obj['x'], 'y': obj['y']}), size=size)
-
-    # Build ePSF
-    log('Building ePSF model with oversampling=%d' % oversampling)
-    epsf_builder = photutils.psf.EPSFBuilder(
-        oversampling=oversampling, maxiters=10, progress_bar=bool(verbose)
-    )
-
-    epsf, fitted_stars = epsf_builder(stars)
-
-    log('ePSF building complete. PSF shape: %s' % str(epsf.data.shape))
-
-    if get_raw:
-        return epsf
-
-    # Build PSFEx-compatible structure
-    psf_data = epsf.data
-
-    # Reshape to (ncoeffs, height, width) format
-    # ePSF is position-invariant, so ncoeffs=1
-    if psf_data.ndim == 2:
-        psf_data = psf_data[np.newaxis, :, :]  # Add coefficient dimension
-
-    psf = {
-        'width': psf_data.shape[2],
-        'height': psf_data.shape[1],
-        'fwhm': fwhm,
-        'sampling': 1.0 / oversampling,  # PSFEx convention: < 1 means supersampled
-        'ncoeffs': 1,
-        'degree': 0,  # Constant PSF (no position dependence)
-        'x0': 0,
-        'y0': 0,
-        'sx': 1,
-        'sy': 1,
-        'data': psf_data,
-        'oversampling': oversampling,  # Keep for reference
-        'type': 'epsf',  # Identify PSF type
-    }
+    if get_raw and psf['degree'] == 0:
+        # photutils expects oversampled PSF images normalized to oversampling**2
+        return photutils.psf.ImagePSF(psf['data'][0] * oversampling**2, oversampling=oversampling)
 
     return psf
 
 
-def _build_polynomial_psf_taper(reference_stamp, sampling, fwhm):
-    """Build a smooth radial taper for low-S/N outer PSF pixels."""
+def _build_polynomial_psf_taper(shape, sampling, fwhm, sample_r, sample_v, snr=3.0):
+    """Build a smooth radial taper for low-S/N outer PSF pixels.
 
-    h, w = reference_stamp.shape
+    The taper starts at the first radius (beyond ``1.25 * fwhm``) where the
+    stacked radial profile of the normalized star samples is not
+    significantly above zero, so that well-measured extended wings (e.g.
+    Moffat) are preserved while noise-dominated outer support is suppressed.
+    No taper is applied if the profile stays significant up to the stamp edge.
+    """
+
+    h, w = shape
     y, x = np.mgrid[0:h, 0:w]
     cx = 0.5 * (w - 1)
     cy = 0.5 * (h - 1)
     r = np.sqrt(((x - cx) * sampling) ** 2 + ((y - cy) * sampling) ** 2)
 
-    peak = float(np.nanmax(reference_stamp))
     half_width = 0.5 * (min(h, w) - 1) * sampling
-    taper_start = 0.75 * half_width
-    threshold = 0.02 * peak
+    r_min = max(1.25 * fwhm, sampling)
+    r_max = max(r_min, half_width - 2 * sampling)
 
-    if np.isfinite(peak) and peak > 0:
-        edges = np.arange(0, np.max(r) + sampling, sampling)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        profile = []
-        for r0, r1 in zip(edges[:-1], edges[1:]):
-            idx = (r >= r0) & (r < r1)
-            profile.append(np.nanmedian(reference_stamp[idx]) if np.any(idx) else np.nan)
-        profile = np.asarray(profile, float)
-        idx = np.where(np.isfinite(profile) & (profile <= threshold))[0]
-        if len(idx):
-            taper_start = float(centers[idx[0]])
+    # Radial profile of the samples, and the uncertainty of its median
+    bin_width = 0.5
+    ok = np.isfinite(sample_r) & np.isfinite(sample_v)
+    ibin = np.floor(sample_r[ok] / bin_width).astype(int)
+    med, scale, count = _group_robust_stats(ibin, sample_v[ok], int(np.max(ibin, initial=0)) + 1)
+    centers = (np.arange(len(med)) + 0.5) * bin_width
+    with np.errstate(invalid='ignore', divide='ignore'):
+        err = 1.2533 * scale / np.sqrt(count)
+    faint = (centers > r_min) & (centers < half_width) & (count >= 5) & ~(med > snr * err)
+    if not np.any(faint):
+        return np.ones(shape), half_width, 0.0
 
-    taper_start = float(
-        np.clip(
-            taper_start,
-            max(1.25 * fwhm, sampling),
-            max(1.25 * fwhm, half_width - 2 * sampling),
-        )
-    )
+    taper_start = float(np.clip(centers[np.argmax(faint)], r_min, r_max))
     taper_width = max(half_width - taper_start, 0.0)
 
     if taper_width <= 0:
-        return np.ones_like(reference_stamp), taper_start, taper_width
+        return np.ones(shape), taper_start, taper_width
 
-    window = np.ones_like(reference_stamp)
+    window = np.ones(shape)
     idx = r > taper_start
     if np.any(idx):
         phase = np.clip((r[idx] - taper_start) / taper_width, 0.0, 1.0)
@@ -927,20 +1058,16 @@ def _build_polynomial_psf_taper(reference_stamp, sampling, fwhm):
     return window, taper_start, taper_width
 
 
-def _regularize_polynomial_psf(coeffs, stamps_array, keep, sampling, fwhm):
+def _regularize_polynomial_psf(coeffs, sampling, fwhm, sample_r, sample_v):
     """Suppress spurious outer support and restore polynomial PSF normalization."""
 
-    import warnings
-
-    with warnings.catch_warnings():
-        # All-NaN pixels (masked in every kept stamp) are expected here
-        warnings.simplefilter('ignore', RuntimeWarning)
-        reference_stamp = np.nanmedian(stamps_array[keep], axis=0)
-    reference_stamp = np.where(np.isfinite(reference_stamp), reference_stamp, 0.0)
-    window, taper_start, taper_width = _build_polynomial_psf_taper(reference_stamp, sampling, fwhm)
+    window, taper_start, taper_width = _build_polynomial_psf_taper(
+        coeffs.shape[1:], sampling, fwhm, sample_r, sample_v
+    )
     coeffs *= window[np.newaxis, :, :]
 
-    template = np.clip(reference_stamp * window, 0.0, None)
+    # Normalization deficit is redistributed following the constant term
+    template = np.clip(coeffs[0], 0.0, None)
     total = float(np.sum(template))
     if not np.isfinite(total) or total <= 0:
         template = window.copy()
@@ -1049,6 +1176,642 @@ def _subtract_local_stamp_background(cutout, mask_cutout=None, mode='none', bord
     return cutout
 
 
+def _group_layout(group, ngroups, select=None):
+    """Precompute placement of grouped values into a NaN-padded table.
+
+    Returns ``(order, rows, cols, shape)`` so that ``table[rows, cols] =
+    values[order]`` places every selected value into the row of its group.
+    Only values with ``select=True`` (all if None) are placed.
+    """
+
+    group = np.asarray(group)
+    index = np.arange(len(group)) if select is None else np.flatnonzero(select)
+    order = index[np.argsort(group[index], kind='stable')]
+    rows = group[order]
+    count = np.bincount(rows, minlength=ngroups)[:ngroups]
+    start = np.concatenate([[0], np.cumsum(count)[:-1]])
+    cols = np.arange(len(order)) - start[rows]
+
+    return order, rows, cols, (ngroups, max(int(count.max(initial=0)), 1))
+
+
+def _nanmedian_rows(table):
+    """Median of finite values in every row of a 2-D array, and their number.
+
+    Vectorized replacement for ``np.nanmedian(table, axis=1)``, which falls
+    back to a slow per-row loop for wide arrays with NaNs.
+    """
+
+    srt = np.sort(table, axis=1)  # NaNs are sorted to the end
+    count = np.sum(np.isfinite(table), axis=1)
+    lo = np.take_along_axis(srt, np.maximum((count - 1) // 2, 0)[:, np.newaxis], axis=1)[:, 0]
+    hi = np.take_along_axis(srt, np.maximum(count // 2, 0)[:, np.newaxis], axis=1)[:, 0]
+    med = np.where(count > 0, 0.5 * (lo + hi), np.nan)
+
+    return med, count
+
+
+def _group_robust_stats(group, values, ngroups, layout=None):
+    """Per-group median, robust (MAD-based) scale and number of finite values.
+
+    ``layout`` from :func:`_group_layout` may be passed to avoid re-sorting
+    when the grouping stays the same between calls; values not covered by it
+    are ignored.
+    """
+
+    if layout is None:
+        layout = _group_layout(group, ngroups, np.isfinite(values))
+    order, rows, cols, shape = layout
+
+    table = np.full(shape, np.nan)
+    table[rows, cols] = np.asarray(values, dtype=np.float64)[order]
+
+    with np.errstate(invalid='ignore'):
+        med, count = _nanmedian_rows(table)
+        mad, _ = _nanmedian_rows(np.abs(table - med[:, np.newaxis]))
+
+    return med, 1.4826 * mad, count
+
+
+def _prefilter_psf_planes(planes, npad=12):
+    """Spline-prefilter PSF coefficient planes for repeated interpolation.
+
+    Uses the same edge handling as ``map_coordinates(mode='nearest')`` with
+    prefiltering: planes are padded by ``npad`` edge values before filtering.
+    """
+
+    return [
+        ndimage.spline_filter(np.pad(plane, npad, mode='edge'), order=3, mode='nearest')
+        for plane in planes
+    ]
+
+
+def _interp_psf_planes(filtered, gx, gy, npad=12):
+    """Interpolate prefiltered planes at model grid coordinates, one array per plane."""
+
+    coords = [np.ravel(gy) + npad, np.ravel(gx) + npad]
+    return [
+        ndimage.map_coordinates(f, coords, order=3, mode='nearest', prefilter=False).reshape(
+            np.shape(gx)
+        )
+        for f in filtered
+    ]
+
+
+def _psf_at_offsets(filtered, terms, ux, uy, sampling, os_size):
+    """Evaluate PSF model at native pixel offsets from source centers.
+
+    ``filtered`` are prefiltered coefficient planes, ``terms`` the polynomial
+    terms of every source (shape ``[..., ncoeffs]``, broadcastable to the
+    offsets with a trailing axis). Returns native pixel values for a source
+    of unit flux, zero outside the model grid.
+    """
+
+    center = (os_size - 1) / 2.0
+    gx = ux / sampling + center
+    gy = uy / sampling + center
+    inside = (gx >= 0) & (gx <= os_size - 1) & (gy >= 0) & (gy <= os_size - 1)
+
+    values = _interp_psf_planes(filtered, gx, gy)
+    result = sum(terms[..., k] * values[k] for k in range(len(values)))
+
+    return np.where(inside, result, 0.0) / sampling**2
+
+
+def _poly_terms(x, y, degree, x0, y0, sx, sy):
+    """Polynomial terms of PSF model at given positions, shape ``[n, ncoeffs]``.
+
+    Same term ordering as :func:`get_supersampled_psf_stamp`: i2 outer, i1 inner.
+    """
+
+    dx = (np.asarray(x, dtype=np.float64) - x0) / sx
+    dy = (np.asarray(y, dtype=np.float64) - y0) / sy
+
+    terms = []
+    for i2 in range(degree + 1):
+        for i1 in range(degree + 1 - i2):
+            terms.append(dx**i1 * dy**i2)
+
+    return np.column_stack(terms)
+
+
+def _fit_catalogue_fluxes(image, mask, cat_x, cat_y, filtered, terms, sampling, os_size, fwhm):
+    """Jointly fit fluxes of catalogue sources with the PSF model.
+
+    Every source is fitted over its core pixels (within ``fwhm`` of its
+    center) together with all sources whose model overlaps them, as a single
+    sparse linear least-squares problem, so that the wings of a bright star
+    do not leak into the flux of a faint neighbour. Returns NaN for sources
+    without usable core pixels.
+    """
+
+    from scipy.spatial import cKDTree
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.linalg import lsqr
+
+    nsrc = len(cat_x)
+    reach = (os_size - 1) / 2.0 * sampling + fwhm
+
+    # Core pixels of every source
+    R = int(np.ceil(fwhm))
+    oy, ox = np.mgrid[-R : R + 1, -R : R + 1]
+    px = np.round(cat_x).astype(int)[:, np.newaxis] + ox.ravel()
+    py = np.round(cat_y).astype(int)[:, np.newaxis] + oy.ravel()
+    good = (px >= 0) & (px < image.shape[1]) & (py >= 0) & (py < image.shape[0])
+    good &= np.hypot(px - cat_x[:, np.newaxis], py - cat_y[:, np.newaxis]) < fwhm
+    pxc = np.clip(px, 0, image.shape[1] - 1)
+    pyc = np.clip(py, 0, image.shape[0] - 1)
+    good &= np.isfinite(image[pyc, pxc])
+    if mask is not None:
+        good &= ~mask[pyc, pxc]
+
+    owner, col = np.nonzero(good)
+    row_x = px[owner, col]
+    row_y = py[owner, col]
+    data = image[row_y, row_x].astype(np.float64)
+    nrows = len(data)
+
+    # Sources contributing to the core pixels of every source: itself and
+    # all others within the reach of the model
+    tree = cKDTree(np.c_[cat_x, cat_y])
+    pairs = tree.query_pairs(reach, output_type='ndarray')
+    pairs = np.concatenate([pairs, pairs[:, ::-1], np.repeat(np.arange(nsrc), 2).reshape(-1, 2)])
+    order = np.argsort(pairs[:, 0], kind='stable')
+    pairs = pairs[order]
+    start = np.searchsorted(pairs[:, 0], np.arange(nsrc + 1))
+
+    # Expand to (row, contributing source) entries
+    rows_start = np.searchsorted(owner, np.arange(nsrc + 1))
+    nrows_src = np.diff(rows_start)
+    ncontrib = np.diff(start)
+    ent_rows = []
+    ent_cols = []
+    for j in np.flatnonzero(nrows_src > 0):
+        r = np.arange(rows_start[j], rows_start[j + 1])
+        c = pairs[start[j] : start[j + 1], 1]
+        ent_rows.append(np.repeat(r, ncontrib[j]))
+        ent_cols.append(np.tile(c, len(r)))
+
+    if not ent_rows:
+        return np.full(nsrc, np.nan)
+
+    ent_rows = np.concatenate(ent_rows)
+    ent_cols = np.concatenate(ent_cols)
+    values = _psf_at_offsets(
+        filtered,
+        terms[ent_cols],
+        row_x[ent_rows] - cat_x[ent_cols],
+        row_y[ent_rows] - cat_y[ent_cols],
+        sampling,
+        os_size,
+    )
+    nz = values != 0
+
+    A = csr_matrix((values[nz], (ent_rows[nz], ent_cols[nz])), shape=(nrows, nsrc))
+    flux = lsqr(A, data, atol=1e-10, btol=1e-10)[0]
+    flux[nrows_src == 0] = np.nan
+
+    return flux
+
+
+def _spline_weights_matrix(samples, os_size, npad=12):
+    """Sparse matrix of cubic B-spline interpolation weights for star samples.
+
+    Maps padded, prefiltered per-star model grids (flattened, stacked over
+    stars) to the values at sample positions, i.e. it is equivalent to
+    ``map_coordinates(order=3, prefilter=False)`` on the output of
+    :func:`_prefilter_psf_planes`, but reusable for any model.
+    """
+
+    from scipy.sparse import csr_matrix
+
+    nstars, nsamp = samples['node'].shape
+    size = os_size + 2 * npad
+    gx = samples['gx'] + npad
+    gy = samples['gy'] + npad
+    ix = np.floor(gx).astype(np.int64)
+    iy = np.floor(gy).astype(np.int64)
+
+    def bspline(t):
+        return np.stack(
+            [
+                (1 - t) ** 3 / 6,
+                (3 * t**3 - 6 * t**2 + 4) / 6,
+                (-3 * t**3 + 3 * t**2 + 3 * t + 1) / 6,
+                t**3 / 6,
+            ],
+            axis=-1,
+        )
+
+    wx = bspline(gx - ix)  # (nstars, nsamp, 4)
+    wy = bspline(gy - iy)
+    offsets = np.arange(-1, 3)
+    cols_x = np.clip(ix[..., np.newaxis] + offsets, 0, size - 1)
+    cols_y = np.clip(iy[..., np.newaxis] + offsets, 0, size - 1)
+
+    star = np.arange(nstars)[:, np.newaxis, np.newaxis, np.newaxis]
+    cols = star * size * size + cols_y[..., :, np.newaxis] * size + cols_x[..., np.newaxis, :]
+    weights = wy[..., :, np.newaxis] * wx[..., np.newaxis, :]
+    rows = np.broadcast_to(np.arange(nstars * nsamp).reshape(nstars, nsamp, 1, 1), cols.shape)
+
+    return csr_matrix(
+        (weights.ravel(), (rows.ravel(), cols.ravel())),
+        shape=(nstars * nsamp, nstars * size * size),
+    )
+
+
+def _eval_psf_at_samples(coeffs, V, samples, os_size, gradient=False):
+    """Evaluate polynomial PSF model for every star at its sample positions.
+
+    Returns an array of shape ``(nstars, nsamp)``, or three of them (value,
+    d/dx and d/dy per oversampled pixel) if ``gradient=True``, in which case
+    the model of every star is first normalized to unit sum over the grid.
+
+    As spline prefiltering is linear, coefficient planes are prefiltered once
+    and combined into per-star grids, which are then interpolated at all
+    samples with a single sparse product; the interpolation weights are
+    computed once per set of samples and cached in it.
+    """
+
+    ncoeffs = V.shape[1]
+    nstars, nsamp = samples['node'].shape
+    planes = coeffs.reshape(ncoeffs, os_size, os_size)
+
+    if samples.get('_weights') is None:
+        samples['_weights'] = _spline_weights_matrix(samples, os_size)
+    W = samples['_weights']
+
+    if gradient:
+        gy, gx = np.gradient(planes, axis=(1, 2))
+        maps = [planes, gx, gy]
+    else:
+        maps = [planes]
+
+    result = []
+    for m in maps:
+        filtered = np.array(_prefilter_psf_planes(m)).reshape(ncoeffs, -1)
+        # Accelerate BLAS raises spurious floating point flags on finite matmuls
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            grids = V @ filtered
+        result.append((W @ grids.ravel()).reshape(nstars, nsamp))
+
+    if gradient:
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            totals = V @ planes.reshape(ncoeffs, -1).sum(axis=1)
+            result = [r / totals[:, np.newaxis] for r in result]
+
+    return result if gradient else result[0]
+
+
+def _sample_noise_variance(value, res, fit, keep, norm):
+    """Expected variance of normalized star samples, shape ``[nstars, nsamp]``.
+
+    Every star's own robust residual level (background noise) plus a source
+    term proportional to the model over star flux, with a global coefficient
+    estimated from the residuals of the core samples of kept stars.
+    """
+
+    with np.errstate(invalid='ignore', divide='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        r = np.where(fit, res, np.nan)
+        sig = 1.4826 * np.nanmedian(np.abs(r - np.nanmedian(r, axis=1)[:, np.newaxis]), axis=1)
+        sig = np.where(np.isfinite(sig) & (sig > 0), sig, np.nan)
+        model = np.clip(value - res, 0, None) / norm[:, np.newaxis]
+        core = fit & keep[:, np.newaxis] & (model > 0.1 * np.nanmax(model))
+        # Median of squared normal deviate is 0.455 of its variance
+        beta = (
+            np.nanmedian(
+                (res[core] ** 2 / 0.455 - np.broadcast_to(sig[:, np.newaxis], res.shape)[core] ** 2)
+                / model[core]
+            )
+            if np.any(core)
+            else 0.0
+        )
+        beta = beta if np.isfinite(beta) and beta > 0 else 0.0
+
+        return sig[:, np.newaxis] ** 2 + beta * model
+
+
+def _solve_polynomial_psf(
+    samples,
+    V,
+    weights,
+    regularization,
+    os_size,
+    coeffs=None,
+    clip_sigma=3.0,
+    maxiter=30,
+    tol=1e-4,
+    tol_flip=1e-3,
+):
+    """Fit per-pixel polynomial PSF model to the star samples.
+
+    Every sample is a star pixel value (normalized to unit star flux) at a
+    known offset from the star center. The model is refined by iteratively
+    fitting per-node polynomials to the residuals of samples assigned to
+    their nearest model node, which converges to a model consistent with the
+    exact sample positions (Anderson & King 2000 ePSF approach).
+
+    Outliers are rejected on two levels, from scratch on every iteration:
+    whole stars with outlying RMS residuals (galaxies, blends), and
+    individual samples deviating from other stars at the same model node
+    (cosmic rays, poorly subtracted neighbours), so that a locally
+    contaminated star still contributes its clean pixels.
+
+    Iterations stop when the model correction is below ``tol`` relative to
+    the model peak and the rejection flipped fewer than ``tol_flip`` of the
+    samples; the rejection of a few samples near the clipping threshold may
+    oscillate indefinitely, so it can't be required to stay exactly the same.
+
+    Returns ``(coeffs, keep, fit, res)`` where ``coeffs`` is ``[ncoeffs, npix]``,
+    ``keep`` flags the stars used, ``fit`` the samples used and ``res`` the
+    final residuals.
+    """
+
+    nstars, nsamp = samples['value'].shape
+    ncoeffs = V.shape[1]
+    nnodes = os_size * os_size
+    node = samples['node']
+    value = samples['value']
+    valid = samples['valid']
+    norm = samples['norm']
+
+    if coeffs is None:
+        coeffs = np.zeros((ncoeffs, nnodes))
+        has_model = False
+    else:
+        coeffs = coeffs.copy()
+        has_model = True
+
+    keep = np.ones(nstars, dtype=bool)
+    fit = valid.copy()
+
+    node_f = node.ravel()
+    star_f = np.repeat(np.arange(nstars), nsamp)
+    star_node = star_f * nnodes + node_f
+    reg = max(regularization, 1e-12) * np.eye(ncoeffs)[np.newaxis]
+    # Node assignment is fixed within the solve, so is the grouping of samples
+    layout = _group_layout(node_f, nnodes, valid.ravel())
+    nvalid = max(int(valid.sum()), 1)
+
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        for iteration in range(maxiter):
+            res = value - _eval_psf_at_samples(coeffs, V, samples, os_size)
+
+            if has_model:
+                # Star-level rejection on the RMS residual over used samples
+                nused = np.maximum(fit.sum(axis=1), 1)
+                star_rms = np.sqrt(np.sum(np.where(fit, res, 0) ** 2, axis=1) / nused)
+                med_rms = np.median(star_rms[keep])
+                mad_rms = np.median(np.abs(star_rms[keep] - med_rms)) * 1.4826
+                new_keep = keep
+                if mad_rms > 1e-15:
+                    new_keep = star_rms < med_rms + clip_sigma * mad_rms
+                    if new_keep.sum() < ncoeffs:
+                        new_keep = keep
+
+                # Sample-level rejection. Residuals are scaled by their expected
+                # noise, as normalized stamps of stars with different brightness
+                # have very different noise, and then compared with the spread
+                # of all kept stars at the same node. Noise model is the star's
+                # own robust background level plus a source term proportional to
+                # the model over star flux, with global coefficient estimated
+                # from the residuals of the core samples.
+                z = res / np.sqrt(_sample_noise_variance(value, res, fit, keep, norm))
+                zk = np.where(fit & new_keep[:, np.newaxis], z, np.nan)
+                med_n, scale_n, count_n = _group_robust_stats(
+                    node_f, zk.ravel(), nnodes, layout=layout
+                )
+                # Node spread can't be tighter than the noise the stars are scaled by
+                scale_n = np.maximum(scale_n, 1.0)
+                bad = np.abs(z - med_n[node]) > clip_sigma * scale_n[node]
+                bad &= (count_n >= max(5, ncoeffs + 1))[node]
+                new_fit = valid & ~bad
+
+                flipped = np.sum(
+                    (fit & keep[:, np.newaxis]) != (new_fit & new_keep[:, np.newaxis])
+                )
+                changed = flipped > tol_flip * nvalid
+                keep = new_keep
+                fit = new_fit
+            else:
+                changed = True
+
+            # Per-node weighted least squares for the model correction. The
+            # polynomial terms are constant within a star, so weights and
+            # weighted residuals are first summed per (star, node)
+            w2 = ((weights**2)[:, np.newaxis] * (fit & keep[:, np.newaxis])).ravel()
+            wr = w2 * np.where(np.isfinite(res), res, 0).ravel()
+            w_sn = np.bincount(star_node, w2, minlength=nstars * nnodes).reshape(nstars, nnodes)
+            r_sn = np.bincount(star_node, wr, minlength=nstars * nnodes).reshape(nstars, nnodes)
+            VTV = np.einsum('sn,sk,sl->nkl', w_sn, V, V, optimize=True)
+            VTr = np.einsum('sn,sk->nk', r_sn, V, optimize=True)
+            try:
+                corr = np.linalg.solve(VTV + reg, VTr[..., np.newaxis])[..., 0].T
+            except np.linalg.LinAlgError:
+                corr = np.einsum('pkl,pl->pk', np.linalg.pinv(VTV + reg), VTr).T
+
+            coeffs += corr
+            has_model = True
+
+            scale = np.max(np.abs(coeffs[0]))
+            if not changed and np.max(np.abs(corr)) < tol * scale:
+                break
+
+        res = value - _eval_psf_at_samples(coeffs, V, samples, os_size)
+
+    return coeffs, keep, fit, res
+
+
+def _fit_stamp_offsets(samples, fit, V, coeffs, os_size, fwhm):
+    """Fit sub-pixel shift and amplitude of every star against its PSF model.
+
+    Solves the linearized least-squares problem
+    ``sample = a*M - a*dx*dM/dx - a*dy*dM/dy`` over the PSF core, where ``M``
+    is the model at the star position normalized to unit sum. Shifts are in
+    image pixels, amplitudes are relative to the unit-sum model.
+    """
+
+    nstars = V.shape[0]
+    sampling = samples['sampling']
+    M, gx, gy = _eval_psf_at_samples(coeffs, V, samples, os_size, gradient=True)
+    core = fit & (samples['r'] < 2 * fwhm)
+
+    dx = np.zeros(nstars)
+    dy = np.zeros(nstars)
+    amp = np.ones(nstars)
+    ok = np.zeros(nstars, dtype=bool)
+
+    for i in range(nstars):
+        use = core[i] & np.isfinite(M[i])
+        if np.sum(use) < 6:
+            continue
+
+        A = np.column_stack([M[i][use], -gx[i][use] / sampling, -gy[i][use] / sampling])
+        sol, _, _, _ = np.linalg.lstsq(A, samples['value'][i][use], rcond=None)
+        if not np.all(np.isfinite(sol)) or sol[0] <= 0:
+            continue
+
+        amp[i] = sol[0]
+        dx[i] = sol[1] / sol[0]
+        dy[i] = sol[2] / sol[0]
+        ok[i] = True
+
+    return dx, dy, amp, ok
+
+
+def _subset_samples(samples, idx):
+    """Samples of a subset of stars."""
+
+    # Cached entries (leading underscore) belong to the full set of samples
+    return {
+        key: (value[idx] if isinstance(value, np.ndarray) else value)
+        for key, value in samples.items()
+        if not key.startswith('_')
+    }
+
+
+def _heldout_star_scores(samples, fit, V, coeffs, var, os_size, fwhm, clip=3.0):
+    """Robust goodness of fit of stars against a PSF model not fitted to them.
+
+    Every star gets its own amplitude and sub-pixel shift fitted over the
+    core, so only the shape of the model is tested. The score is the mean
+    over used core samples (within ``2 * fwhm``, where PSF photometry gets
+    its information) of the squared normalized residual, clipped at ``clip``
+    sigma. Outer samples are not scored: they are much more numerous, and
+    small noise-level differences there would outweigh the core mismatch
+    that biases PSF fluxes. Returns NaN for stars that can't be fitted.
+    """
+
+    nstars = V.shape[0]
+    sampling = samples['sampling']
+    M, gx, gy = _eval_psf_at_samples(coeffs, V, samples, os_size, gradient=True)
+    core = fit & (samples['r'] < 2 * fwhm)
+
+    scores = np.full(nstars, np.nan)
+    for i in range(nstars):
+        use = core[i] & np.isfinite(M[i])
+        if np.sum(use) < 6:
+            continue
+        A = np.column_stack([M[i], -gx[i] / sampling, -gy[i] / sampling])
+        sol, _, _, _ = np.linalg.lstsq(A[use], samples['value'][i][use], rcond=None)
+        if not np.all(np.isfinite(sol)) or sol[0] <= 0:
+            continue
+        ok = core[i] & np.isfinite(var[i]) & (var[i] > 0)
+        if not np.any(ok):
+            continue
+        z2 = (samples['value'][i][ok] - A[ok] @ sol) ** 2 / var[i][ok]
+        scores[i] = np.mean(np.minimum(z2, clip**2))
+
+    return scores
+
+
+def _select_psf_degree(
+    samples,
+    fit,
+    keep,
+    var,
+    positions_x,
+    positions_y,
+    image_shape,
+    weights,
+    regularization,
+    os_size,
+    fwhm,
+    degrees,
+    norm_params,
+    coeffs_start,
+    log,
+    nblocks=4,
+    min_scored=10,
+):
+    """Choose polynomial degree of the PSF model by spatial cross-validation.
+
+    The field is split into ``nblocks x nblocks`` blocks, assigned to
+    ``nblocks`` folds so that every fold is spread over the field. For every
+    candidate degree, the model is fitted to the stars outside a fold and
+    tested on the stars inside it. Degrees are compared by paired per-star
+    score differences, and the lowest degree not worse than the best one by
+    more than one standard error of the difference is chosen.
+
+    Returns the chosen degree, the full-data solution for it as
+    ``(coeffs, keep, fit, res)``, and a dict with per-degree mean score
+    differences to the best degree and their errors.
+    """
+
+    x0, y0, sx, sy = norm_params
+    h, w = image_shape
+    bx = np.clip((positions_x / w * nblocks).astype(int), 0, nblocks - 1)
+    by = np.clip((positions_y / h * nblocks).astype(int), 0, nblocks - 1)
+    folds = (bx + 2 * by) % nblocks
+
+    scores = {}
+    solutions = {}
+    for degree in degrees:
+        ncoeffs = (degree + 1) * (degree + 2) // 2
+        V = _poly_terms(positions_x, positions_y, degree, x0, y0, sx, sy)
+        start = np.zeros((ncoeffs, coeffs_start.shape[1]))
+        start[0] = coeffs_start[0]
+        solutions[degree] = _solve_polynomial_psf(
+            samples, V, weights, regularization, os_size, coeffs=start
+        )
+
+        scores[degree] = np.full(len(positions_x), np.nan)
+        for f in range(nblocks):
+            train = np.flatnonzero(folds != f)
+            test = np.flatnonzero((folds == f) & keep)
+            if not len(test) or len(train) < 2 * ncoeffs:
+                continue
+            coeffs_f, _, _, _ = _solve_polynomial_psf(
+                _subset_samples(samples, train),
+                V[train],
+                weights[train],
+                regularization,
+                os_size,
+                coeffs=solutions[degree][0],
+            )
+            scores[degree][test] = _heldout_star_scores(
+                _subset_samples(samples, test), fit[test], V[test], coeffs_f, var[test], os_size, fwhm
+            )
+
+    # Paired comparison on stars scored for all degrees
+    good = np.all([np.isfinite(scores[d]) for d in degrees], axis=0)
+    ngood = int(np.sum(good))
+    means = {d: np.mean(scores[d][good]) if ngood else 0.0 for d in degrees}
+    best = min(degrees, key=lambda d: means[d])
+    info = {'degrees': list(degrees), 'nstars': ngood, 'registration_degree': degrees[-1]}
+    info['score_diff'] = [float(means[d] - means[best]) for d in degrees]
+    info['score_diff_err'] = [
+        float(np.std(scores[d][good] - scores[best][good]) / np.sqrt(ngood)) if ngood else 0.0
+        for d in degrees
+    ]
+
+    chosen = best
+    for d, diff, err in zip(degrees, info['score_diff'], info['score_diff_err']):
+        if diff <= err:
+            chosen = d
+            break
+
+    if info['nstars'] < min_scored:
+        log(
+            'Warning: only %d stars could be scored for degree selection, using degree %d'
+            % (info['nstars'], degrees[0])
+        )
+        chosen = degrees[0]
+
+    log(
+        'Degree selection on %d stars: '
+        % info['nstars']
+        + ', '.join(
+            'degree %d: %+.4f +- %.4f' % (d, diff, err)
+            for d, diff, err in zip(degrees, info['score_diff'], info['score_diff_err'])
+        )
+        + ' -> degree %d' % chosen
+    )
+
+    return chosen, solutions[chosen], info
+
+
 def _create_psf_model_polynomial(
     image,
     obj,
@@ -1061,16 +1824,32 @@ def _create_psf_model_polynomial(
     subtract_neighbors,
     neighbors,
     background_mode,
+    maxiters,
     log,
+    max_degree=None,
 ):
-    """Build position-dependent PSF by fitting per-pixel polynomials to star stamps.
+    """Build PSF model by fitting per-pixel polynomials to star stamps.
 
-    Follows the PSFEx algorithm: resamples star cutouts onto an oversampled
-    grid, then fits polynomial coefficients per pixel via least squares.
+    Native star pixels are used directly at their true sub-pixel offsets
+    from the star centers, as in Anderson & King (2000) ePSF construction,
+    since interpolating the stamps onto a common grid would smooth the PSF
+    core. Per-pixel polynomial coefficients of the model are then fitted to
+    them; ``degree=0`` reduces this to a (weighted, outlier-clipped) mean.
+
+    The build is iterated similarly to EPIMETHEUS (Benotto et al. 2026):
+    every star is fitted with the current model for a sub-pixel shift and an
+    amplitude, and its original cutout pixels are placed again at the refined
+    center and normalized by the fitted amplitude, so the star pixels are
+    never interpolated.
     """
 
+    auto_degree = degree is None
+    if auto_degree:
+        # Refined below from the number of usable stars
+        degree = 0
     ncoeffs = (degree + 1) * (degree + 2) // 2
-    log('Building position-dependent PSF model: degree=%d (%d coefficients)' % (degree, ncoeffs))
+    if not auto_degree:
+        log('Building PSF model: degree=%d (%d coefficients)' % (degree, ncoeffs))
     if background_mode != 'none':
         log('Subtracting local stamp background using %s model' % background_mode)
 
@@ -1086,7 +1865,6 @@ def _create_psf_model_polynomial(
     if os_size % 2 == 0:
         os_size += 1
     os_center = (os_size - 1) / 2.0
-    cut_center = (size - 1) / 2.0
 
     # Normalization parameters: image center and half-size
     # This maps coordinates to approximately [-1, 1] range
@@ -1095,14 +1873,11 @@ def _create_psf_model_polynomial(
     sx = image.shape[1] / 2.0
     sy = image.shape[0] / 2.0
 
-    # Oversampled coordinate grid (computed once, reused for all stamps)
-    oy, ox = np.mgrid[0:os_size, 0:os_size]
-    ox_rel = (ox - os_center) * sampling  # relative to stamp center, in image pixels
-    oy_rel = (oy - os_center) * sampling
-
     # Build neighbor subtraction data if requested
-    # We subtract Gaussian approximations of all OTHER detections (from the
-    # full catalogue, not just the training stars) from each cutout
+    # We subtract all OTHER detections (from the full catalogue, not just the
+    # training stars) from each cutout: first using Gaussian approximations
+    # with catalogue fluxes, then with the current PSF model and fluxes
+    # jointly fitted with it on every following iteration
     if subtract_neighbors and neighbors is not None and 'flux' in neighbors.colnames:
         sigma = fwhm / 2.3548  # FWHM to sigma
         nb_x = np.array(neighbors['x'], dtype=np.float64)
@@ -1113,133 +1888,209 @@ def _create_psf_model_polynomial(
     else:
         subtract_neighbors = False
 
-    # Extract and resample stamps
-    stamps = []
-    stamp_valids = []
+    # Cutouts carry a margin around the stamp so that the refined centres
+    # still have data to sample from; margin pixels outside the image are masked
+    margin = 2
+    max_shift = 1.0  # Largest allowed total centre refinement, image pixels
+    half = size // 2
+    chalf = half + margin
+    cut_y, cut_x = np.mgrid[0 : 2 * chalf + 1, 0 : 2 * chalf + 1]
+
+    def _clean_cutout(raw, mask_cutout, nb_image):
+        """Cutout with neighbours subtracted, masked pixels zeroed and background removed."""
+        cutout = raw - nb_image
+        if mask_cutout is not None:
+            cutout[mask_cutout] = 0.0
+        if background_mode != 'none':
+            cutout = _subtract_local_stamp_background(cutout, mask_cutout, mode=background_mode)
+        return cutout
+
+    def _sample_star(cutout, mask_cutout, dx, dy):
+        """Cutout pixels of a star with sub-pixel offset (dx, dy) from cutout center."""
+        # Native pixels at their true offsets from the star, in model grid units
+        ux = (cut_x - chalf - dx).ravel()
+        uy = (cut_y - chalf - dy).ravel()
+        gx = ux / sampling + os_center
+        gy = uy / sampling + os_center
+        # Only samples within the node grid, as the model can't be
+        # interpolated beyond its outermost nodes
+        inside = (gx >= 0) & (gx <= os_size - 1) & (gy >= 0) & (gy <= os_size - 1)
+        valid = inside.copy()
+        if mask_cutout is not None:
+            valid &= ~mask_cutout.ravel()
+        node = np.round(gy).astype(int) * os_size + np.round(gx).astype(int)
+
+        return {
+            # Model grid stores native pixel values per unit grid area
+            'value': cutout.ravel() * sampling**2 * inside,
+            'valid': valid,
+            'node': np.where(inside, node, 0),
+            'gx': gx,
+            'gy': gy,
+            'r': np.hypot(ux, uy),
+        }
+
+    # Extract cutouts once; they are sampled again on every iteration
+    raw_cutouts = []
+    cutouts = []
+    cutout_masks = []
+    origins = []
+    int_x = []
+    int_y = []
     positions_x = []
     positions_y = []
     stamp_fluxes = []
-    half = size // 2
+    norms = []
+
+    # Plain arrays, as per-element access to (masked) table columns is slow
+    obj_x = np.ma.filled(np.ma.asarray(obj['x'], dtype=np.float64), np.nan)
+    obj_y = np.ma.filled(np.ma.asarray(obj['y'], dtype=np.float64), np.nan)
+    if 'flux' in obj.colnames:
+        obj_flux = np.ma.filled(np.ma.asarray(obj['flux'], dtype=np.float64), np.nan)
+    else:
+        obj_flux = np.ones(len(obj))
 
     for i in range(len(obj)):
-        x_star = float(obj['x'][i])
-        y_star = float(obj['y'][i])
+        x_star = obj_x[i]
+        y_star = obj_y[i]
+        if not np.isfinite(x_star) or not np.isfinite(y_star):
+            continue
 
-        # Integer center and sub-pixel offset
+        # Integer center
         ix = int(np.round(x_star))
         iy = int(np.round(y_star))
-        dx = x_star - ix
-        dy = y_star - iy
 
-        # Cutout boundaries
-        x1, x2 = ix - half, ix + half + 1
-        y1, y2 = iy - half, iy + half + 1
-
-        # Skip if cutout extends beyond image
-        if x1 < 0 or x2 > image.shape[1] or y1 < 0 or y2 > image.shape[0]:
+        # Skip if the stamp itself extends beyond image
+        if (
+            ix - half < 0
+            or ix + half + 1 > image.shape[1]
+            or iy - half < 0
+            or iy + half + 1 > image.shape[0]
+        ):
             continue
 
-        cutout = image[y1:y2, x1:x2].astype(np.float64).copy()
+        # Cutout boundaries, with the margin clipped to the image
+        x1, x2 = ix - chalf, ix + chalf + 1
+        y1, y2 = iy - chalf, iy + chalf + 1
+        cx1, cx2 = max(x1, 0), min(x2, image.shape[1])
+        cy1, cy2 = max(y1, 0), min(y2, image.shape[0])
 
-        # Subtract estimated neighbor flux from cutout
-        if subtract_neighbors:
-            # Pixel coordinate grids for this cutout
-            cy, cx = np.mgrid[y1:y2, x1:x2]
-            for j in range(len(nb_x)):
-                # Skip the target star itself (matched by position, as the
-                # neighbour catalogue may differ from the training list)
-                if abs(nb_x[j] - x_star) < 0.5 and abs(nb_y[j] - y_star) < 0.5:
-                    continue
-                # Skip neighbors too far to affect this cutout
-                ndx = nb_x[j] - ix
-                ndy = nb_y[j] - iy
-                if abs(ndx) > half + 5 * sigma or abs(ndy) > half + 5 * sigma:
-                    continue
-                # Subtract Gaussian approximation
-                r2 = (cx - nb_x[j]) ** 2 + (cy - nb_y[j]) ** 2
-                amp = nb_flux[j] / (2 * np.pi * sigma**2)
-                cutout -= amp * np.exp(-r2 / (2 * sigma**2))
+        cutout = np.zeros((2 * chalf + 1, 2 * chalf + 1), dtype=np.float64)
+        cutout[cy1 - y1 : cy2 - y1, cx1 - x1 : cx2 - x1] = image[cy1:cy2, cx1:cx2]
 
-        # Skip if mask has too many bad pixels in this cutout
-        mask_cutout = None
-        if mask is not None:
-            mask_cutout = mask[y1:y2, x1:x2]
-            if np.sum(mask_cutout) > 0.1 * cutout.size:
-                continue
-            cutout[mask_cutout] = 0.0
-
-        if background_mode != 'none':
-            cutout = _subtract_local_stamp_background(cutout, mask_cutout, mode=background_mode)
-
-        # Resample to oversampled grid, centering star at stamp center
-        # Map each oversampled pixel back to cutout coordinates
-        cutout_x = cut_center + dx + ox_rel
-        cutout_y = cut_center + dy + oy_rel
-
-        stamp = ndimage.map_coordinates(
-            cutout, [cutout_y, cutout_x], order=3, mode='constant', cval=0.0
+        mask_cutout = np.ones_like(cutout, dtype=bool)
+        mask_cutout[cy1 - y1 : cy2 - y1, cx1 - x1 : cx2 - x1] = (
+            mask[cy1:cy2, cx1:cx2] if mask is not None else False
         )
 
-        # Track oversampled pixels touched by masked image pixels, so the
-        # per-pixel polynomial fit can exclude them instead of being dragged
-        # towards the zero-filled values
-        if mask_cutout is not None and np.any(mask_cutout):
-            valid = (
-                ndimage.map_coordinates(
-                    (~mask_cutout).astype(np.float64),
-                    [cutout_y, cutout_x],
-                    order=1,
-                    mode='constant',
-                    cval=1.0,
-                )
-                > 0.99
-            )
-        else:
-            valid = np.ones((os_size, os_size), dtype=bool)
+        # Skip if mask has too many bad pixels inside the stamp
+        if np.sum(mask_cutout[margin:-margin, margin:-margin]) > 0.1 * size**2:
+            continue
 
-        # Normalize to unit flux
-        total = np.sum(stamp)
+        if not np.any(mask_cutout):
+            mask_cutout = None
+
+        # Initial neighbour model
+        nb_image = np.zeros_like(cutout)
+        if subtract_neighbors:
+            # Neighbours close enough to affect this cutout, except the target
+            # star itself (matched by position, as the neighbour catalogue may
+            # differ from the training list)
+            near = (np.abs(nb_x - ix) <= chalf + 5 * sigma) & (
+                np.abs(nb_y - iy) <= chalf + 5 * sigma
+            )
+            near &= ~((np.abs(nb_x - x_star) < 0.5) & (np.abs(nb_y - y_star) < 0.5))
+            if np.any(near):
+                # Pixel coordinate grids for this cutout
+                cy, cx = np.mgrid[y1:y2, x1:x2]
+                for j in np.where(near)[0]:
+                    # Subtract Gaussian approximation
+                    r2 = (cx - nb_x[j]) ** 2 + (cy - nb_y[j]) ** 2
+                    amp = nb_flux[j] / (2 * np.pi * sigma**2)
+                    nb_image += amp * np.exp(-r2 / (2 * sigma**2))
+
+        raw = cutout
+        cutout = _clean_cutout(raw, mask_cutout, nb_image)
+
+        # Initial normalization to unit flux of the samples at catalogue position
+        s = _sample_star(cutout, mask_cutout, x_star - ix, y_star - iy)
+        total = np.sum(s['value']) / sampling**2
         if not np.isfinite(total) or total <= 0:
             continue
-        stamp /= total
 
-        stamps.append(stamp)
-        stamp_valids.append(valid)
+        raw_cutouts.append(raw)
+        cutouts.append(cutout)
+        cutout_masks.append(mask_cutout)
+        origins.append((x1, y1))
+        int_x.append(ix)
+        int_y.append(iy)
         positions_x.append(x_star)
         positions_y.append(y_star)
-        stamp_fluxes.append(float(obj['flux'][i]) if 'flux' in obj.colnames else 1.0)
+        stamp_fluxes.append(obj_flux[i])
+        norms.append(total)
 
-    nstars = len(stamps)
-    log('Extracted %d valid stamps for polynomial fitting' % nstars)
+    nstars = len(cutouts)
+    log('Extracted %d valid stamps for PSF fitting' % nstars)
+
+    # Every model pixel is constrained only by the stars whose pixels fall
+    # onto it, i.e. by about nstars / oversampling**2 of them
+    min_stars_per_coeff = 5
+    samples_per_node = nstars / oversampling**2
+
+    if auto_degree:
+        # Highest degree with enough samples per polynomial coefficient; the
+        # model is built with it, and the degree is then selected below
+        candidates = [
+            d
+            for d in range(int(max_degree) + 1)
+            if samples_per_node >= min_stars_per_coeff * (d + 1) * (d + 2) // 2
+        ] or [0]
+        degree = candidates[-1]
+        ncoeffs = (degree + 1) * (degree + 2) // 2
+        log(
+            'Building PSF model: automatic degree up to %d (%d stars)' % (degree, nstars)
+        )
+    elif samples_per_node < min_stars_per_coeff * ncoeffs:
+        log(
+            'Warning: %d stars at oversampling %d may be too few to constrain '
+            'degree %d PSF model (%d coefficients); consider degree=\'auto\''
+            % (nstars, oversampling, degree, ncoeffs)
+        )
 
     if nstars < ncoeffs:
         raise ValueError(
             "Only %d valid stamps, need at least %d for degree=%d" % (nstars, ncoeffs, degree)
         )
 
+    positions_x = np.array(positions_x)
+    positions_y = np.array(positions_y)
+    int_x = np.array(int_x)
+    int_y = np.array(int_y)
+    norms = np.array(norms)
+
     # Build Vandermonde matrix [nstars x ncoeffs]
-    # Same term ordering as get_supersampled_psf_stamp: i2 outer, i1 inner
-    x_norm = (np.array(positions_x) - x0) / sx
-    y_norm = (np.array(positions_y) - y0) / sy
+    V = _poly_terms(positions_x, positions_y, degree, x0, y0, sx, sy)
     stamp_fluxes = np.asarray(stamp_fluxes, dtype=float)
 
-    V = []
-    for i2 in range(degree + 1):
-        for i1 in range(degree + 1 - i2):
-            V.append(x_norm**i1 * y_norm**i2)
-    V = np.column_stack(V)
+    if subtract_neighbors:
+        from scipy.spatial import cKDTree
 
-    # Stack stamps as [nstars, npixels]
-    stamps_array = np.array(stamps)  # [nstars, os_size, os_size]
-    pixels = stamps_array.reshape(nstars, -1)  # [nstars, npixels]
-    valid_array = np.array(stamp_valids)  # [nstars, os_size, os_size]
-    valid_pix = valid_array.reshape(nstars, -1)  # [nstars, npixels]
-    all_valid = bool(np.all(valid_pix))
-    if not all_valid:
-        log(
-            'Masked pixels present in %d / %d stamps, using per-pixel fit weights'
-            % (int(np.sum(~valid_pix.all(axis=1))), nstars)
+        # Catalogue sources whose model may reach every cutout, except the
+        # star itself (matched by position, as the neighbour catalogue may
+        # differ from the training list)
+        nb_terms = _poly_terms(nb_x, nb_y, degree, x0, y0, sx, sy)
+        reach = np.sqrt(2) * chalf + (os_size - 1) / 2.0 * sampling
+        nb_lists = cKDTree(np.c_[nb_x, nb_y]).query_ball_point(np.c_[positions_x, positions_y], reach)
+        pair_star = np.concatenate(
+            [np.full(len(l), k, dtype=int) for k, l in enumerate(nb_lists)] + [np.zeros(0, int)]
         )
+        pair_nb = np.concatenate([np.asarray(l, dtype=int) for l in nb_lists] + [np.zeros(0, int)])
+        is_self = (np.abs(nb_x[pair_nb] - positions_x[pair_star]) < 0.5) & (
+            np.abs(nb_y[pair_nb] - positions_y[pair_star]) < 0.5
+        )
+        pair_star = pair_star[~is_self]
+        pair_nb = pair_nb[~is_self]
+        origins = np.array(origins, dtype=np.float64).reshape(-1, 2)
 
     # Each training stamp is normalized to unit flux, so an unweighted solve
     # over-emphasizes low-S/N outer pixels from fainter stars and broadens the
@@ -1252,113 +2103,150 @@ def _create_psf_model_polynomial(
             weights[valid_flux] = stamp_fluxes[valid_flux] / flux_ref
             weights = np.clip(weights, 0.3, 5.0)
             log(
-                'Applying flux weights to polynomial PSF fit: median %.0f, range %.2f..%.2f'
+                'Applying flux weights to PSF fit: median %.0f, range %.2f..%.2f'
                 % (flux_ref, np.min(weights), np.max(weights))
             )
 
-    # Solve per-pixel polynomial with iterative sigma-clipping.
-    # Outlier stamps (from neighbor contamination or artifacts) bias
-    # the mean-based least-squares fit; clipping rejects them.
-    keep = np.ones(nstars, dtype=bool)
-    clip_sigma = 3.0
-    max_clip_iters = 3
+    # Iterative refinement of star centres and normalizations
+    centers_x = positions_x.copy()
+    centers_y = positions_y.copy()
+    coeffs = None
 
-    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-        for clip_iter in range(max_clip_iters + 1):
-            n_keep = int(keep.sum())
-
-            if n_keep < ncoeffs:
-                break
-
-            if all_valid:
-                w_k = weights[keep]
-                V_k = V[keep] * w_k[:, np.newaxis]
-                pixels_k = pixels[keep] * w_k[:, np.newaxis]
-
-                if regularization > 0:
-                    VTV = V_k.T @ V_k + regularization * np.eye(ncoeffs)
-                    VTp = V_k.T @ pixels_k
-                    coeffs = np.linalg.solve(VTV, VTp)
-                else:
-                    coeffs, _, _, _ = np.linalg.lstsq(V_k, pixels_k, rcond=None)
-            else:
-                # Per-pixel normal equations excluding masked stamp pixels:
-                # each output pixel gets its own (ncoeffs x ncoeffs) system
-                # built only from the stamps valid at that pixel
-                Wm = (weights[keep] ** 2)[:, np.newaxis] * valid_pix[keep]  # (n, npix)
-                VTV = np.einsum('sp,sk,sl->pkl', Wm, V[keep], V[keep], optimize=True)
-                VTp = np.einsum('sp,sk->pk', Wm * pixels[keep], V[keep], optimize=True)
-                VTV += max(regularization, 0.0) * np.eye(ncoeffs)[np.newaxis]
-                try:
-                    coeffs = np.linalg.solve(VTV, VTp[..., np.newaxis])[..., 0].T
-                except np.linalg.LinAlgError:
-                    # Pixels with too few valid stamps yield singular systems
-                    coeffs = np.einsum(
-                        'pkl,pl->pk', np.linalg.pinv(VTV), VTp, optimize=True
-                    ).T
-
-            if clip_iter == max_clip_iters:
-                break
-
-            # Compute per-stamp RMS residual over valid pixels only
-            reconstructed = V @ coeffs  # all stamps, not just kept
-            res2 = (pixels - reconstructed) ** 2
-            if all_valid:
-                stamp_rms = np.sqrt(np.mean(res2, axis=1))
-            else:
-                nvalid = np.maximum(valid_pix.sum(axis=1), 1)
-                stamp_rms = np.sqrt(np.sum(res2 * valid_pix, axis=1) / nvalid)
-
-            med_rms = np.median(stamp_rms[keep])
-            mad_rms = np.median(np.abs(stamp_rms[keep] - med_rms)) * 1.4826
-            if mad_rms < 1e-15:
-                break
-
-            new_keep = stamp_rms < med_rms + clip_sigma * mad_rms
-            n_rejected = int(keep.sum() - new_keep.sum())
-            if n_rejected == 0:
-                break
-            if new_keep.sum() < ncoeffs:
-                break
-
-            keep = new_keep
-            log(
-                'Sigma-clip iter %d: rejected %d stamps, %d remaining'
-                % (clip_iter + 1, n_rejected, keep.sum())
+    for it in range(maxiters + 1):
+        if it > 0 and subtract_neighbors and len(pair_nb):
+            # Subtract neighbours using current model and jointly fitted fluxes
+            filtered = _prefilter_psf_planes(coeffs.reshape(ncoeffs, os_size, os_size))
+            fit_flux = _fit_catalogue_fluxes(
+                image, mask, nb_x, nb_y, filtered, nb_terms, sampling, os_size, fwhm
             )
+            fit_flux = np.where(np.isfinite(fit_flux), fit_flux, nb_flux)
+
+            ux = (origins[pair_star, 0] - nb_x[pair_nb])[:, np.newaxis, np.newaxis] + cut_x
+            uy = (origins[pair_star, 1] - nb_y[pair_nb])[:, np.newaxis, np.newaxis] + cut_y
+            nb_values = _psf_at_offsets(
+                filtered, nb_terms[pair_nb][:, np.newaxis, np.newaxis, :], ux, uy, sampling, os_size
+            )
+            nb_images = np.zeros((nstars,) + cut_x.shape)
+            np.add.at(nb_images, pair_star, nb_values * fit_flux[pair_nb][:, np.newaxis, np.newaxis])
+
+            cutouts = [
+                _clean_cutout(raw_cutouts[k], cutout_masks[k], nb_images[k]) for k in range(nstars)
+            ]
+
+        per_star = [
+            _sample_star(
+                cutouts[k], cutout_masks[k], centers_x[k] - int_x[k], centers_y[k] - int_y[k]
+            )
+            for k in range(nstars)
+        ]
+        samples = {key: np.array([s[key] for s in per_star]) for key in per_star[0]}
+        samples['value'] /= norms[:, np.newaxis]
+        samples['norm'] = norms.copy()
+        samples['sampling'] = sampling
+
+        coeffs, keep, fit, res = _solve_polynomial_psf(
+            samples, V, weights, regularization, os_size, coeffs=coeffs
+        )
+
+        if it == maxiters:
+            break
+
+        dx, dy, amp, ok = _fit_stamp_offsets(samples, fit, V, coeffs, os_size, fwhm)
+
+        # Shifts common to all stars (or smoothly varying over the field, up
+        # to the polynomial degree) are degenerate with a shift of the model
+        # itself, so only keep the part not explained by the polynomial terms.
+        # This anchors the model centre to the catalogue centroid convention.
+        ref = ok & keep
+        if np.sum(ref) > ncoeffs:
+            for d in (dx, dy):
+                sol, _, _, _ = np.linalg.lstsq(V[ref], d[ref], rcond=None)
+                with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+                    d -= V @ sol
+        dx[~ok] = 0
+        dy[~ok] = 0
+
+        new_x = positions_x + np.clip(
+            centers_x + np.clip(dx, -0.5, 0.5) - positions_x, -max_shift, max_shift
+        )
+        new_y = positions_y + np.clip(
+            centers_y + np.clip(dy, -0.5, 0.5) - positions_y, -max_shift, max_shift
+        )
+        step = np.hypot(new_x - centers_x, new_y - centers_y)
+        rms_step = np.sqrt(np.mean(step[ref] ** 2)) if np.any(ref) else 0.0
+
+        log(
+            'Iteration %d: %d/%d stamps kept, %d pixels clipped, '
+            'RMS centre correction %.4f px, amplitude median %.3f'
+            % (
+                it + 1,
+                int(keep.sum()),
+                nstars,
+                int(np.sum(samples['valid'] & ~fit)),
+                rms_step,
+                np.median(amp[ok]) if np.any(ok) else np.nan,
+            )
+        )
+
+        # At least one refinement is always applied, to replace the initial
+        # stamp-sum normalization by the fitted amplitudes
+        if it > 0 and rms_step < 0.005:
+            break
+
+        centers_x, centers_y = new_x, new_y
+        norms[ok] *= amp[ok]
+
+    degree_info = None
+    if auto_degree and len(candidates) > 1:
+        var = _sample_noise_variance(samples['value'], res, fit, keep, samples['norm'])
+        degree, (coeffs, keep, fit, res), degree_info = _select_psf_degree(
+            samples,
+            fit,
+            keep,
+            var,
+            positions_x,
+            positions_y,
+            image.shape,
+            weights,
+            regularization,
+            os_size,
+            fwhm,
+            candidates,
+            (x0, y0, sx, sy),
+            coeffs,
+            log,
+        )
+        ncoeffs = (degree + 1) * (degree + 2) // 2
+        V = _poly_terms(positions_x, positions_y, degree, x0, y0, sx, sy)
+
+    # Residual statistics before regularization
+    used = fit & keep[:, np.newaxis]
+    rms = np.sqrt(np.sum(np.where(used, res, 0) ** 2) / max(int(used.sum()), 1))
 
     # Suppress low-S/N outer support where the polynomial fit otherwise tends
     # to create square-edge pedestals and ringing.
-    ref_stamps = (
-        stamps_array if all_valid else np.where(valid_array, stamps_array, np.nan)
-    )
     psf_data, taper_start, taper_width = _regularize_polynomial_psf(
         coeffs.reshape(ncoeffs, os_size, os_size),
-        ref_stamps,
-        keep,
         sampling,
         fwhm,
+        samples['r'][used],
+        samples['value'][used],
     )
-    coeffs = psf_data.reshape(ncoeffs, -1)
     if taper_width > 0:
-        log(
-            'Applied outer taper to polynomial PSF: start %.2f px, width %.2f px'
-            % (taper_start, taper_width)
-        )
+        log('Applied outer taper to PSF: start %.2f px, width %.2f px' % (taper_start, taper_width))
 
-    # Compute and report residual statistics
-    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-        reconstructed = V[keep] @ coeffs
-        res2 = (pixels[keep] - reconstructed) ** 2
-        if all_valid:
-            rms = np.sqrt(np.nanmean(res2))
-        else:
-            vk = valid_pix[keep]
-            rms = np.sqrt(np.nansum(res2 * vk) / max(int(vk.sum()), 1))
     log(
-        'Polynomial PSF fit: %d x %d pixels, %d coefficients, '
-        '%d/%d stamps used, RMS residual %.2e (per pixel, normalized)'
-        % (os_size, os_size, ncoeffs, int(keep.sum()), nstars, rms)
+        'PSF fit: %d x %d pixels, %d coefficients, '
+        '%d/%d stamps used, %d pixels clipped, RMS residual %.2e (per pixel, normalized)'
+        % (
+            os_size,
+            os_size,
+            ncoeffs,
+            int(keep.sum()),
+            nstars,
+            int(np.sum(samples['valid'] & ~fit)),
+            rms,
+        )
     )
 
     psf = {
@@ -1375,7 +2263,11 @@ def _create_psf_model_polynomial(
         'data': psf_data,
         'oversampling': oversampling,
         'type': 'epsf',
+        # Model pixels sample the pixel-integrated PSF (Anderson & King ePSF)
+        'subpixel_integrated': False,
     }
+    if degree_info is not None:
+        psf['degree_selection'] = degree_info
 
     return psf
 

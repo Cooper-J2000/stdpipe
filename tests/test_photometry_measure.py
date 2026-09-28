@@ -827,6 +827,35 @@ class TestMaskedColumnHandling:
             result_regular['flux'], result_masked['flux'], decimal=5
         )
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize('method', ['aperture', 'centroid', 'sep', 'psf'])
+    def test_masked_positions_are_not_measured(
+        self, image_with_sources, detected_objects_masked, method
+    ):
+        """Masked positions must be skipped, not measured at the values
+        hidden under the mask (the masked row lies on a real source)."""
+        from stdpipe import photometry_psf
+
+        obj = detected_objects_masked
+        if method == 'aperture':
+            result = photometry_measure.measure_objects(obj, image_with_sources, aper=5.0)
+        elif method == 'centroid':
+            result = photometry_measure.measure_objects(
+                obj, image_with_sources, aper=5.0, fwhm=3.0, centroid_iter=3
+            )
+            assert result['x_orig'].mask[3]
+        elif method == 'sep':
+            if not photometry_measure._HAS_SEP_OPTIMAL:
+                pytest.skip('SEP-X not available')
+            result = photometry_measure.measure_objects_sep(obj, image_with_sources, aper=5.0)
+        else:
+            result = photometry_psf.measure_objects_psf(obj, image_with_sources, fwhm=3.0)
+
+        assert len(result) == len(obj)
+        assert np.all(np.isfinite(result['flux'][:3]))
+        assert not np.isfinite(result['flux'][3])
+        assert result['x'].mask[3] and result['y'].mask[3]
+
 
 class TestFullyMaskedFootprints:
     """Test measure_objects behavior when object footprints are fully masked.
@@ -1770,8 +1799,10 @@ class TestSEPPSFPhotometry:
         )
 
         # Check output columns
-        for col in ['flux', 'fluxerr', 'mag', 'magerr', 'x_psf', 'y_psf', 'flags_psf']:
+        for col in ['flux', 'fluxerr', 'mag', 'magerr', 'x_orig', 'y_orig', 'flags_psf']:
             assert col in result.colnames, f"Missing column: {col}"
+        # Fitted positions are stored in the standard columns
+        assert 'x_psf' not in result.colnames and 'y_psf' not in result.colnames
 
         # Flux should be within 5% of truth
         assert abs(result['flux'][0] / true_flux - 1) < 0.05
@@ -1779,7 +1810,7 @@ class TestSEPPSFPhotometry:
     @_skip_no_sep_psf
     @pytest.mark.unit
     def test_psf_fit_output_columns_not_present_for_aperture(self, isolated_star_image):
-        """Aperture photometry (psf=None) should NOT produce x_psf/y_psf columns."""
+        """Aperture photometry (psf=None) should NOT produce PSF fit columns."""
         image, fwhm, true_flux, bg, noise = isolated_star_image
         obj = Table({'x': [128.0], 'y': [128.0]})
 
@@ -1790,8 +1821,7 @@ class TestSEPPSFPhotometry:
             gain=1.0,
         )
 
-        assert 'x_psf' not in result.colnames
-        assert 'y_psf' not in result.colnames
+        assert 'x_orig' not in result.colnames
         assert 'flags_psf' not in result.colnames
 
     @_skip_no_sep_psf
@@ -1899,15 +1929,15 @@ class TestSEPPSFPhotometry:
         )
 
         # Position should be within 0.1 pixel of truth
-        dx = abs(result['x_psf'][0] - 128.0)
-        dy = abs(result['y_psf'][0] - 128.0)
-        assert dx < 0.1, f"x_psf offset {dx:.3f} > 0.1 pix"
-        assert dy < 0.1, f"y_psf offset {dy:.3f} > 0.1 pix"
+        dx = abs(result['x'][0] - 128.0)
+        dy = abs(result['y'][0] - 128.0)
+        assert dx < 0.1, f"x offset {dx:.3f} > 0.1 pix"
+        assert dy < 0.1, f"y offset {dy:.3f} > 0.1 pix"
 
     @_skip_no_sep_psf
     @pytest.mark.unit
     def test_psf_fit_no_position_fitting(self, isolated_star_image):
-        """With fit_positions=False, x_psf/y_psf should match input positions."""
+        """With fit_positions=False, positions are kept as they are."""
         image, fwhm, true_flux, bg, noise = isolated_star_image
         obj = Table({'x': [128.0], 'y': [128.0]})
         psf_model = sep.PSF.from_gaussian(fwhm)
@@ -1920,8 +1950,9 @@ class TestSEPPSFPhotometry:
             fit_positions=False,
         )
 
-        assert result['x_psf'][0] == 128.0
-        assert result['y_psf'][0] == 128.0
+        assert result['x'][0] == 128.0
+        assert result['y'][0] == 128.0
+        assert 'x_orig' not in result.colnames
 
     @_skip_no_sep_psf
     @pytest.mark.unit
@@ -1954,7 +1985,8 @@ class TestSEPPSFPhotometry:
         )
 
         # The fitter should move towards the star; if shift > 1 pixel, flag is set
-        shift = np.sqrt((result['x_psf'][0] - 127.0) ** 2 + (result['y_psf'][0] - 128.0) ** 2)
+        assert result['x_orig'][0] == 127.0
+        shift = np.sqrt((result['x'][0] - 127.0) ** 2 + (result['y'][0] - 128.0) ** 2)
         if shift > 1.0:
             assert result['flags'][0] & 0x2000, "Large shift should set 0x2000 flag"
 
@@ -2255,8 +2287,8 @@ class TestSEPPSFPhotometry:
         )
 
         # Positions must be unchanged
-        np.testing.assert_array_equal(result['x_psf'], obj['x'])
-        np.testing.assert_array_equal(result['y_psf'], obj['y'])
+        np.testing.assert_array_equal(result['x'], obj['x'])
+        np.testing.assert_array_equal(result['y'], obj['y'])
 
         # chi2 should be NaN (no position fitting → no chi2)
         assert np.all(np.isnan(result['chi2_psf']))
@@ -2454,8 +2486,8 @@ class TestSEPPSFPhotometry:
         assert np.all(result['flux'] > 0)
 
         # Positions still unchanged
-        np.testing.assert_array_equal(result['x_psf'], obj['x'])
-        np.testing.assert_array_equal(result['y_psf'], obj['y'])
+        np.testing.assert_array_equal(result['x'], obj['x'])
+        np.testing.assert_array_equal(result['y'], obj['y'])
 
 
 # ============================================================================
@@ -2491,6 +2523,67 @@ def _make_field(positions, total_fluxes, sigma=2.0, shape=(200, 200), noise=0.0,
 
 
 @pytest.mark.unit
+class TestSEPPSFSampledModel:
+    """SEP PSF fitting should follow the declared sampling convention of the model."""
+
+    @pytest.mark.unit
+    @_skip_no_sep_psf
+    def test_point_sampled_supersampled_model(self):
+        """Point-sampled pixel-integrated models must not be integrated again by SEP."""
+        from scipy.special import erf
+
+        if not hasattr(sep.PSF, 'sampled'):
+            pytest.skip("SEP without support for point-sampled PSF models")
+
+        fwhm = 2.6
+        sigma = fwhm / 2.3548
+
+        def pixel_integrated(u):
+            s = np.sqrt(2) * sigma
+            return 0.5 * (erf((u + 0.5) / s) - erf((u - 0.5) / s))
+
+        n = 31  # oversampling 2, center at n // 2
+        g = (np.arange(n) - n // 2) * 0.5
+        data = np.outer(pixel_integrated(g), pixel_integrated(g))
+        data /= np.sum(data)
+        model = {
+            'data': data[np.newaxis],
+            'width': n,
+            'height': n,
+            'fwhm': fwhm,
+            'sampling': 0.5,
+            'degree': 0,
+            'x0': 0,
+            'y0': 0,
+            'sx': 1,
+            'sy': 1,
+            'subpixel_integrated': False,
+        }
+
+        image = np.zeros((128, 128))
+        xs, ys = [], []
+        u = np.arange(128)
+        for i, phase in enumerate([0.0, 0.2, 0.4, 0.6, 0.8]):
+            x0, y0 = 20.0 + 20 * i + phase, 64.0 + phase
+            image += 1e4 * np.outer(pixel_integrated(u - y0), pixel_integrated(u - x0))
+            xs.append(x0)
+            ys.append(y0)
+        obj = Table({'x': xs, 'y': ys})
+
+        result = photometry_measure.measure_objects_sep(
+            obj,
+            image,
+            psf=model,
+            fwhm=fwhm,
+            bg=np.zeros_like(image),
+            err=np.ones_like(image),
+            group_sources=False,
+        )
+
+        # Integrating samples over image pixels again biased fluxes by +2..+5%
+        np.testing.assert_allclose(result['flux'], 1e4, rtol=0.003)
+
+
 class TestMeasureApertureDeblended:
     """Tests for ``measure_aperture_deblended``."""
 

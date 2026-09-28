@@ -161,7 +161,7 @@ class TestMeasureObjectsPSF:
         assert len(result) > 0
 
         # Check that expected columns are present
-        required_cols = ['flux', 'fluxerr', 'mag', 'magerr', 'x_psf', 'y_psf']
+        required_cols = ['flux', 'fluxerr', 'mag', 'magerr', 'x_orig', 'y_orig']
         for col in required_cols:
             assert col in result.colnames
 
@@ -172,8 +172,8 @@ class TestMeasureObjectsPSF:
         # (within a few pixels for our clean artificial data)
         if len(result) > 0:
             pos_diff = np.sqrt(
-                (result['x_psf'] - result['x'])**2 +
-                (result['y_psf'] - result['y'])**2
+                (result['x'] - result['x_orig'])**2 +
+                (result['y'] - result['y_orig'])**2
             )
             # Most should be well-centered
             assert np.median(pos_diff[np.isfinite(pos_diff)]) < 2.0
@@ -335,8 +335,64 @@ class TestMeasureObjectsPSF:
             verbose=False,
         )
 
-        assert abs(result_fixed['x_psf'][0] - obj['x'][0]) < 1e-3
-        assert abs(result_free['x_psf'][0] - 25.0) < abs(obj['x'][0] - 25.0)
+        assert abs(result_fixed['x'][0] - obj['x'][0]) < 1e-3
+        assert abs(result_free['x'][0] - 25.0) < abs(obj['x'][0] - 25.0)
+        assert result_free['x_orig'][0] == obj['x'][0]
+
+    @pytest.mark.unit
+    def test_measure_objects_psf_default_maxiters_converges(self):
+        """Default maxiters lets the fit converge from an offset position
+        and a poor initial flux guess (no 'flux' column).
+
+        ``maxiters`` limits the function evaluations, so a few units stop
+        the fit before its first step."""
+        size = 51
+        fwhm = 3.0
+        sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
+        flux = 5e4
+        image = _make_gaussian_image(size, 25.3, 24.6, fwhm, flux / (2 * np.pi * sigma**2))
+        obj = Table({'x': [25.0], 'y': [25.0]})
+
+        result = photometry_psf.measure_objects_psf(
+            obj,
+            image,
+            fwhm=fwhm,
+            bg=np.zeros_like(image),
+            err=np.ones_like(image),
+            verbose=False,
+        )
+
+        assert result['flags_psf'][0] & 8 == 0  # converged
+        assert result['flux'][0] == pytest.approx(flux, rel=0.05)
+        assert result['x'][0] == pytest.approx(25.3, abs=0.02)
+        assert result['y'][0] == pytest.approx(24.6, abs=0.02)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('position_dependent', [False, True])
+    def test_measure_objects_psf_partially_masked_fit_kept(self, position_dependent):
+        """A masked pixel inside the fit region (photutils flag bit 1) does
+        not invalidate the fit; only non-convergence (bit 8) does."""
+        size = 64
+        flux = 5e4
+        psf_dict = _make_psf_dict(size=25)
+        image = _make_gaussian_image(size, 30.2, 31.7, 3 * 2.3548, flux / (2 * np.pi * 3**2))
+        mask = np.zeros(image.shape, dtype=bool)
+        mask[31, 35] = True
+
+        result = photometry_psf.measure_objects_psf(
+            Table({'x': [30.0], 'y': [32.0], 'flux': [4e4]}),
+            image,
+            psf=psf_dict,
+            mask=mask,
+            use_position_dependent_psf=position_dependent,
+            bg=np.zeros_like(image),
+            err=np.ones_like(image),
+            verbose=False,
+        )
+
+        assert result['flags_psf'][0] & 1
+        assert result['flags'][0] & 0x1000 == 0
+        assert result['flux'][0] == pytest.approx(flux, rel=0.02)
 
     @pytest.mark.unit
     def test_measure_objects_psf_fit_size_even(self):
@@ -540,8 +596,9 @@ class TestMeasureObjectsPSF:
         assert 'cfit_psf' in result.colnames
         assert 'flags_psf' in result.colnames
         assert 'npix_psf' in result.colnames
-        assert 'x_psf' in result.colnames
-        assert 'y_psf' in result.colnames
+        # Fitted positions are stored in the standard columns
+        assert 'x_psf' not in result.colnames
+        assert 'x_orig' in result.colnames
 
         # Check that columns have reasonable values
         assert len(result) > 0
@@ -579,8 +636,8 @@ class TestMeasureObjectsPSF:
 
         # Should have expected columns
         assert 'flux' in result.colnames
-        assert 'x_psf' in result.colnames
-        assert 'y_psf' in result.colnames
+        assert 'x_orig' in result.colnames
+        assert 'y_orig' in result.colnames
 
         # Unmasked objects (first 3) should have some valid results
         valid_count = np.sum(np.isfinite(result['flux'][:3]))
@@ -748,6 +805,224 @@ class TestCreatePSFModel:
         assert epsf['oversampling'] == 4
 
 
+class TestCreatePSFModelAccuracy:
+    """Test accuracy of reconstructed ePSF against the known input PSF."""
+
+    @staticmethod
+    def _make_image(true_psf, n_stars=150, size=512, noise_std=5.0, seed=42):
+        rng = np.random.default_rng(seed)
+        image = rng.normal(0, noise_std, (size, size))
+        margin = 30
+        xs = rng.uniform(margin, size - margin, n_stars)
+        ys = rng.uniform(margin, size - margin, n_stars)
+        fluxes = rng.uniform(5e4, 2e5, n_stars)
+        for x_s, y_s, flux in zip(xs, ys, fluxes):
+            psf.place_psf_stamp(image, true_psf, x_s, y_s, flux=flux)
+
+        obj = Table({'x': xs, 'y': ys, 'flux': fluxes, 'flags': np.zeros(n_stars, dtype=int)})
+
+        return image, obj
+
+    @staticmethod
+    def _compare(model, true_psf, fwhm):
+        """Return peak ratio and relative PSF-fit flux bias of model vs truth."""
+        peaks, biases = [], []
+        for dx, dy in [(0, 0), (0.3, -0.2), (-0.45, 0.45), (0.5, 0.1)]:
+            m = psf.get_psf_stamp(model, 0, 0, dx, dy)
+            t = psf.get_psf_stamp(true_psf, 0, 0, dx, dy)
+            h = min(m.shape[0], t.shape[0]) // 2
+            cm, ct = m.shape[0] // 2, t.shape[0] // 2
+            m = m[cm - h : cm + h + 1, cm - h : cm + h + 1]
+            t = t[ct - h : ct + h + 1, ct - h : ct + h + 1]
+            yy, xx = np.mgrid[-h : h + 1, -h : h + 1]
+            core = np.hypot(xx - dx, yy - dy) < 2 * fwhm
+            peaks.append(m.max() / t.max())
+            biases.append(np.sum(m[core] * t[core]) / np.sum(m[core] ** 2) / np.sum(t) - 1)
+        return np.mean(peaks), np.mean(biases)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('fwhm', [1.8, 3.0])
+    def test_core_not_smoothed(self, fwhm):
+        """Constant ePSF core should match the input PSF, well- and under-sampled."""
+        from stdpipe import simulation
+
+        true_psf = simulation.create_psf_model(fwhm=fwhm, psf_type='gaussian', oversampling=4)
+        image, obj = self._make_image(true_psf)
+
+        model = psf.create_psf_model(image, obj=obj, fwhm=fwhm, verbose=False)
+        assert model['oversampling'] == (2 if fwhm < 2.5 else 1)
+
+        peak, bias = self._compare(model, true_psf, fwhm)
+        assert abs(peak - 1) < 0.01
+        assert abs(bias) < 0.003
+
+    @pytest.mark.unit
+    def test_recentering_fixes_noisy_positions(self):
+        """Iterative recentering should undo broadening from centroid errors."""
+        from stdpipe import simulation
+
+        fwhm = 1.8
+        true_psf = simulation.create_psf_model(fwhm=fwhm, psf_type='gaussian', oversampling=4)
+        image, obj = self._make_image(true_psf)
+        rng = np.random.default_rng(1)
+        obj['x'] += rng.normal(0, 0.2, len(obj))
+        obj['y'] += rng.normal(0, 0.2, len(obj))
+
+        peak0, bias0 = self._compare(
+            psf.create_psf_model(image, obj=obj, fwhm=fwhm, maxiters=0), true_psf, fwhm
+        )
+        peak, bias = self._compare(psf.create_psf_model(image, obj=obj, fwhm=fwhm), true_psf, fwhm)
+
+        assert peak0 < 0.99  # Single pass is visibly broadened
+        assert abs(peak - 1) < 0.01
+        assert abs(bias) < 0.003
+
+    @pytest.mark.unit
+    def test_pixel_rejection_of_cosmic_rays(self):
+        """Per-pixel rejection should handle defects present in most stars."""
+        from stdpipe import simulation
+
+        fwhm = 3.0
+        true_psf = simulation.create_psf_model(fwhm=fwhm, psf_type='gaussian', oversampling=4)
+        image, obj = self._make_image(true_psf)
+        rng = np.random.default_rng(2)
+        for x, y, flux in zip(obj['x'], obj['y'], obj['flux']):
+            if rng.uniform() < 0.8:
+                cx = int(round(x + rng.uniform(-1.5, 1.5) * fwhm))
+                cy = int(round(y + rng.uniform(-1.5, 1.5) * fwhm))
+                image[cy, cx] += rng.uniform(0.05, 0.3) * flux / (1.1331 * fwhm**2)
+
+        peak, bias = self._compare(psf.create_psf_model(image, obj=obj, fwhm=fwhm), true_psf, fwhm)
+
+        assert abs(peak - 1) < 0.01
+        assert abs(bias) < 0.003
+
+    @pytest.mark.unit
+    def test_model_based_neighbour_subtraction(self):
+        """Non-Gaussian neighbours should be subtracted with the model itself."""
+        from stdpipe import photometry, simulation
+
+        fwhm = 2.2
+        true_psf = simulation.create_psf_model(
+            fwhm=fwhm, psf_type='moffat', beta=2.5, oversampling=4
+        )
+        rng = np.random.default_rng(42)
+        image = rng.normal(0, 5.0, (512, 512))
+        rows = []
+        # Every star has an equally bright neighbour at 3 FWHM, whose Moffat
+        # wings a Gaussian approximation would leave in the stamp
+        for x in np.arange(30, 490, 40.0):
+            for y in np.arange(30, 490, 40.0):
+                x1, y1 = x + rng.uniform(-0.5, 0.5), y + rng.uniform(-0.5, 0.5)
+                angle = rng.uniform(0, 2 * np.pi)
+                flux = rng.uniform(5e4, 2e5)
+                psf.place_psf_stamp(image, true_psf, x1, y1, flux=flux)
+                psf.place_psf_stamp(
+                    image,
+                    true_psf,
+                    x1 + 3 * fwhm * np.cos(angle),
+                    y1 + 3 * fwhm * np.sin(angle),
+                    flux=flux,
+                )
+                rows.append((x1, y1, flux))
+        obj = Table(rows=rows, names=['x', 'y', 'flux'])
+        det = photometry.get_objects_sep(image, thresh=5, aper=fwhm, verbose=False)
+
+        model = psf.create_psf_model(image, obj=obj, fwhm=fwhm, neighbors_obj=det, isolation=0)
+
+        # Compare with the true PSF truncated to the model stamp, at zero
+        # sub-pixel shift so that no interpolation of the model is involved
+        m = psf.get_psf_stamp(model, 0, 0, 0, 0)
+        t = psf.get_psf_stamp(true_psf, 0, 0, 0, 0)
+        h = min(m.shape[0], t.shape[0]) // 2
+        cm, ct = m.shape[0] // 2, t.shape[0] // 2
+        m = m[cm - h : cm + h + 1, cm - h : cm + h + 1]
+        t = t[ct - h : ct + h + 1, ct - h : ct + h + 1]
+        m = m / np.sum(m)
+        t = t / np.sum(t)
+        yy, xx = np.mgrid[-h : h + 1, -h : h + 1]
+        core = np.hypot(xx, yy) < 2 * fwhm
+
+        # Gaussian approximation of neighbours gives 0.989 and +0.8% here
+        assert m.max() / t.max() == pytest.approx(1, abs=0.006)
+        assert np.sum(m[core] * t[core]) / np.sum(m[core] ** 2) == pytest.approx(1, abs=0.0055)
+
+    @pytest.mark.unit
+    def test_moffat_wings_preserved(self):
+        """Outer taper should not cut significant extended wings."""
+        from stdpipe import simulation
+
+        fwhm = 3.0
+        true_psf = simulation.create_psf_model(
+            fwhm=fwhm, psf_type='moffat', beta=2.5, oversampling=4
+        )
+        image, obj = self._make_image(true_psf)
+
+        model = psf.create_psf_model(image, obj=obj, fwhm=fwhm, size=21)
+        m = psf.get_psf_stamp(model, 0, 0, 0, 0)
+        t = psf.get_psf_stamp(true_psf, 0, 0, 0, 0)
+        h = m.shape[0] // 2
+        ct = t.shape[0] // 2
+        t = t[ct - h : ct + h + 1, ct - h : ct + h + 1]
+        t /= np.sum(t)
+
+        yy, xx = np.mgrid[-h : h + 1, -h : h + 1]
+        wing = np.hypot(xx, yy) > 1.5 * fwhm
+        # About 20% of flux inside the stamp is in the wings
+        assert np.sum(m[wing]) == pytest.approx(np.sum(t[wing]), rel=0.05)
+
+    @pytest.mark.unit
+    def test_get_raw_returns_imagepsf(self):
+        """get_raw=True should return photutils model with unit flux."""
+        import photutils.psf
+        from stdpipe import simulation
+
+        true_psf = simulation.create_psf_model(fwhm=1.8, psf_type='gaussian', oversampling=4)
+        image, obj = self._make_image(true_psf, n_stars=50)
+
+        model = psf.create_psf_model(image, obj=obj, fwhm=1.8, get_raw=True)
+
+        assert isinstance(model, photutils.psf.ImagePSF)
+        yy, xx = np.mgrid[-10:11, -10:11]
+        assert np.sum(model(xx, yy)) == pytest.approx(1.0, rel=0.01)
+
+
+class TestMeasureObjectsPSFConvention:
+    """PSF photometry should follow the declared sampling convention of the model."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('psf_type', ['gaussian', 'moffat'])
+    def test_subpixel_integrated_model(self, psf_type):
+        """Sub-pixel integrated (simulation) models must be converted for photutils."""
+        from stdpipe import simulation
+
+        fwhm = 2.6
+        model = simulation.create_psf_model(fwhm=fwhm, psf_type=psf_type, oversampling=4)
+        rng = np.random.default_rng(0)
+        image = np.zeros((256, 256))
+        xs, ys = [], []
+        for x in np.arange(30, 230, 40.0):
+            for y in np.arange(30, 230, 40.0):
+                xs.append(x + rng.uniform(-0.5, 0.5))
+                ys.append(y + rng.uniform(-0.5, 0.5))
+                psf.place_psf_stamp(image, model, xs[-1], ys[-1], flux=1e5)
+        obj = Table({'x': xs, 'y': ys, 'flux': np.full(len(xs), 1e5)})
+
+        result = photometry_psf.measure_objects_psf(
+            obj,
+            image,
+            psf=model,
+            fwhm=fwhm,
+            bg=np.zeros_like(image),
+            err=np.ones_like(image),
+            group_sources=False,
+            compute_quality=False,
+        )
+
+        # Treating integrated sub-pixels as samples biased fluxes by -2..-3%
+        assert np.median(result['flux']) / 1e5 == pytest.approx(1, abs=0.005)
+
+
 class TestCreatePSFModelPolynomial:
     """Test position-dependent PSF model creation via polynomial fitting."""
 
@@ -782,6 +1057,67 @@ class TestCreatePSFModelPolynomial:
         obj['flags'] = np.zeros(n_stars, dtype=int)
 
         return image.astype(np.float64), obj
+
+    @pytest.mark.unit
+    def test_auto_degree_constant_psf(self):
+        """Automatic degree should not add spatial terms for a constant PSF."""
+        image, obj = self._make_varying_psf_image(n_stars=80, fwhm_gradient=0.0)
+
+        result = psf.create_psf_model(image, obj=obj, fwhm=3.0, degree='auto', verbose=False)
+
+        assert result['degree'] == 0
+        info = result['degree_selection']
+        assert info['degrees'][0] == 0
+        assert len(info['score_diff']) == len(info['degrees'])
+
+    @pytest.mark.unit
+    def test_auto_degree_varying_psf(self):
+        """Automatic degree should model a strong PSF gradient."""
+        image, obj = self._make_varying_psf_image(n_stars=80, fwhm_gradient=1.5)
+
+        result = psf.create_psf_model(image, obj=obj, fwhm=3.0, degree='auto', verbose=False)
+
+        assert result['degree'] >= 1
+        assert result['ncoeffs'] == (result['degree'] + 1) * (result['degree'] + 2) // 2
+        assert result['data'].shape[0] == result['ncoeffs']
+
+    @pytest.mark.unit
+    def test_auto_degree_limited_by_star_count(self):
+        """Candidate degrees are limited to what the number of stars supports."""
+        image, obj = self._make_varying_psf_image(n_stars=20, fwhm_gradient=1.5)
+
+        result = psf.create_psf_model(
+            image, obj=obj, fwhm=3.0, degree='auto', isolation=0, verbose=False
+        )
+
+        # 20 stars at 5 stars per coefficient allow degree 1 (3 coefficients) at most
+        assert result['degree'] <= 1
+        assert max(result['degree_selection']['degrees']) <= 1
+
+    @pytest.mark.unit
+    def test_auto_degree_undersampled_matches_explicit(self):
+        """For under-sampled PSF, candidates account for oversampling, and the
+        automatic model is identical to an explicit build with the chosen degree."""
+        from stdpipe import simulation
+
+        fwhm = 2.0
+        true_psf = simulation.create_psf_model(fwhm=fwhm, oversampling=4)
+        rng = np.random.default_rng(1)
+        image = rng.normal(0, 1.0, (512, 512))
+        xs = rng.uniform(20, 492, 80)
+        ys = rng.uniform(20, 492, 80)
+        fluxes = rng.uniform(5e4, 2e5, 80)
+        for x, y, f in zip(xs, ys, fluxes):
+            psf.place_psf_stamp(image, true_psf, x, y, flux=f)
+        obj = Table({'x': xs, 'y': ys, 'flux': fluxes})
+
+        auto = psf.create_psf_model(image, obj=obj, fwhm=fwhm, degree='auto', isolation=0)
+        assert auto['oversampling'] == 2
+        # 80 stars / oversampling**2 = 20 samples per model pixel: up to degree 1
+        assert max(auto['degree_selection']['degrees']) == 1
+
+        explicit = psf.create_psf_model(image, obj=obj, fwhm=fwhm, degree=auto['degree'], isolation=0)
+        np.testing.assert_allclose(auto['data'], explicit['data'], atol=1e-12)
 
     @pytest.mark.unit
     def test_degree1_structure(self):
