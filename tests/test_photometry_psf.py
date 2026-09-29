@@ -6,6 +6,7 @@ Tests PSF photometry routines using photutils.
 
 import pytest
 import numpy as np
+import photutils.psf
 from astropy.table import Table
 
 from stdpipe import photometry_psf
@@ -416,6 +417,32 @@ class TestMeasureObjectsPSF:
         )
 
         assert result['npix_psf'][0] == 11 * 11
+
+    @pytest.mark.unit
+    def test_measure_objects_psf_photutils_model_instance(self):
+        """Test that a photutils PSF model instance (not a dict) is accepted."""
+        image = _make_gaussian_image(101, 50, 50, 3.0, 1000.0)
+
+        obj = Table()
+        obj['x'] = [50.0]
+        obj['y'] = [50.0]
+
+        psf_model = photutils.psf.ImagePSF(np.ones((11, 11)) / 121.0)
+
+        result = photometry_psf.measure_objects_psf(
+            obj.copy(),
+            image,
+            psf=psf_model,
+            fwhm=3.0,
+            bg=np.zeros_like(image),
+            err=np.ones_like(image),
+            verbose=False,
+        )
+
+        assert len(result) == 1
+        assert result['npix_psf'][0] == 11 * 11
+        assert np.isfinite(result['flux'][0])
+        assert result['flux'][0] > 0
 
     @pytest.mark.unit
     def test_measure_objects_psf_psf_size_sampling(self):

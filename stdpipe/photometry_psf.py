@@ -41,6 +41,13 @@ else:
     _INCLUDE_LOCALBKG_ARG = 'include_localbkg'
     _NPIXFIT_COL = 'npixfit'
 
+# photutils 3.0 removed FittableImageModel, the class ImagePSF used to derive
+# from, so it has to be checked for instead of being named unconditionally.
+if hasattr(photutils.psf, 'FittableImageModel'):
+    _PSF_MODEL_CLASSES = (photutils.psf.ImagePSF, photutils.psf.FittableImageModel)
+else:
+    _PSF_MODEL_CLASSES = (photutils.psf.ImagePSF,)
+
 
 def _odd_int(value, min_value=1):
     value = int(np.round(value))
@@ -512,7 +519,7 @@ def measure_objects_psf(
         Input image as a 2D NumPy array.
     psf : photutils PSF model, dict, or None, optional
         PSF model to use. Can be a photutils PSF model (e.g.,
-        IntegratedGaussianPRF, FittableImageModel), a PSFEx PSF structure from
+        IntegratedGaussianPRF, ImagePSF), a PSFEx PSF structure from
         :func:`stdpipe.psf.run_psfex`, or None (will create Gaussian PSF based
         on fwhm).
     psf_size : int or None, optional
@@ -745,8 +752,9 @@ def measure_objects_psf(
             if psf_size is None:
                 psf_size = _compute_native_psf_size(psf_image.shape[0], psf_sampling)
 
-    elif isinstance(psf, (photutils.psf.ImagePSF, photutils.psf.FittableImageModel)):
-        # Already a photutils PSF model (ImagePSF or legacy FittableImageModel)
+    elif isinstance(psf, _PSF_MODEL_CLASSES):
+        # Already a photutils PSF model (ImagePSF, or FittableImageModel
+        # before photutils 3.0)
         log('Using provided photutils ImagePSF model')
         psf_model = psf
         if psf_size is None:
