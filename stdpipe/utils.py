@@ -4,12 +4,12 @@ import requests
 import dateutil
 import shlex
 
-from contextlib import contextmanager
-
 try:
     import fcntl
 except ImportError:  # Windows and other non-POSIX platforms
     fcntl = None
+
+from contextlib import contextmanager
 
 from tqdm.auto import tqdm
 

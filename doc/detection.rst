@@ -16,6 +16,10 @@ The first two have mostly identical signatures and arguments, but differ in mino
 
 The detection in both cases is based on building the noise model through (grid-based) background and background rms estimation, and then extracting the groups of connected pixels above some pre-defined threshold. Optionally, before the thresholding, the image may be smoothed with some small kernel in order to improve the detection of fainter objects. We recommend checking the `SExtractor documentation <https://sextractor.readthedocs.io/>`_ to better understand the concepts of it.
 
+.. note::
+
+   The minimal footprint area (``minarea``, ``DETECT_MINAREA`` in *SExtractor*) also acts as an additional, FWHM-dependent detection threshold. For a source with a Gaussian profile of width :math:`\sigma_e` on the detection image, the footprint above the threshold :math:`t` has :math:`2\pi\sigma_e^2\ln(\nu/t)` pixels, with :math:`\nu` the peak significance, so only sources with :math:`\nu > t\,\exp({\rm minarea}/2\pi\sigma_e^2)` are detected. Here :math:`\sigma_e^2 = \sigma_{\rm PSF}^2 + \sigma_{\rm kernel}^2` with smoothing, and :math:`2\sigma_{\rm PSF}^2` for PSF-matched detection. With the default ``minarea=5``, this is negligible for well-sampled images (the threshold is raised by ~30% at FWHM = 3 pixels with PSF-matched detection), but strong for undersampled ones: a factor of ~2.7 at FWHM = 1.5 pixels, and ~4.6 at FWHM = 1.2 pixels, where faint stars have footprints of just 1-3 pixels. For such images, use a smaller ``minarea`` (down to 1), and control the false detection rate with the threshold itself. With :func:`~stdpipe.photometry.get_objects_sep`, ``minnthresh='auto'`` may then be used to reject single-pixel artefacts like hot pixels and cosmic rays.
+
 Also, the routines may automatically reject the objects detected too close to frame edge, and probably truncated or improperly measured - this is controlled by `edge` argument. Less significant detections - with :math:`\frac1{\rm magerr} < {\rm S/N}` - may also be automatically rejected by providing the `sn` argument.
 
 Both routines return the results as a standard Astropy Table, ordered by the object brightness. The table contains at least the following columns:
@@ -90,6 +94,30 @@ Finally, using SExtractor star/galaxy separators - `CLASS_STAR` and `SPREAD_MODE
 
 .. autofunction:: stdpipe.photometry.get_objects_sextractor
    :noindex:
+
+Detection filter in SEP-based detection
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default, :func:`~stdpipe.photometry.get_objects_sep` thresholds the unsmoothed image (``r0=0``, same as :func:`~stdpipe.photometry.get_objects_sextractor`). Faint point sources are detected much better on an image filtered with a kernel matched to the PSF, which may be requested in several ways:
+
+- ``r0`` - sigma of the Gaussian smoothing kernel, in pixels;
+- ``r0=None`` - the kernel follows the known FWHM (numeric or callable ``fwhm`` argument) with sigma ``0.8*FWHM/2.355``, close to a matched filter but still resolving pairs ~1.2 FWHM apart; without known FWHM, ``r0=0.5`` is used;
+- ``r0='auto'`` - same, but without known FWHM the objects are detected twice: first with ``r0=0.5``, then with the kernel following the FWHM estimated from the first pass;
+- ``psf=...`` - PSF-matched detection on the significance image from ``sep.psf_snr()`` (requires *sep-x*), following the spatial variation of the PSF model.
+
+Smoothing spreads sharp artefacts like hot pixels or cosmic rays into footprints looking like the ones of real objects. They may be rejected with ``minnthresh`` - minimal number of unsmoothed pixels in the footprint that are above the threshold scaled down by the noise reduction factor of the filter :math:`f = \sqrt{\sum k^2}/\sum k`, i.e. as significant individually as the filtered image had to be for the detection. Faint stars have such pixels in most of their footprint, while sharp artefacts have just one. Good values grow with the kernel size (~2 for ``r0=0.5``, ~5 for the kernel following FWHM = 3 pixels), and ``minnthresh='auto'`` sets them for every object from its footprint size and the expected number of noise pixels above that threshold. It is best suited for the filters matched to the PSF (``r0=None``, ``r0='auto'`` or ``psf``), and also rejects faint stars in undersampled images, or when the kernel is much smaller than the PSF.
+
+.. code-block:: python
+
+   # Detect faint stars using a kernel matched to the known FWHM,
+   # rejecting hot pixels and cosmic rays
+   obj = photometry.get_objects_sep(image, mask=mask, thresh=3.0, aper=1.0,
+                fwhm=fwhm, r0=None, minnthresh='auto', verbose=True)
+
+   # PSF-matched detection with the PSFEx model of the image
+   psf_model = psf.run_psfex(image, mask=mask, order=2, gain=gain)
+   obj = photometry.get_objects_sep(image, mask=mask, thresh=3.0, aper=1.0,
+                fwhm=fwhm, psf=psf_model, minnthresh='auto', verbose=True)
 
 .. autofunction:: stdpipe.photometry.get_objects_sep
    :noindex:
@@ -203,6 +231,8 @@ The detection routines use a globally estimated background model (built as a low
                 aper=1.0, bkgann=[5, 7], sn=5, verbose=True)
    print(len(obj), 'objects properly measured')
 
+The noise of the local background estimate is included in ``fluxerr`` (and in ``bg_fluxerr``). It is predicted from the noise map as the noise of the mean of the annulus pixels, scaled for the estimator - by ~1.25 for ``'median'`` and ~2.5 for ``'mode'`` (default), that are less efficient than the mean for Gaussian noise - and is stored in the ``bg_local_err`` column. For a 5-7 FWHM annulus it increases the flux errors of faint objects by ~2% for the mean and ~12% for the mode, and much more for narrower annuli. Grouped optimal extraction fits its own background for the groups of overlapping objects, so it is only added for the isolated ones.
+
 
 Centroiding
 ^^^^^^^^^^^
@@ -223,7 +253,7 @@ You can refine object positions before photometry using iterative centroiding. T
 Optimal extraction
 ^^^^^^^^^^^^^^^^^^
 
-For point sources, optimal extraction (`Naylor 1998 <https://ui.adsabs.harvard.edu/abs/1998MNRAS.296..339N>`_) provides ~10% improvement in signal-to-noise ratio by using PSF-weighted photometry instead of simple aperture sums:
+For point sources, optimal extraction (`Naylor 1998 <https://scixplorer.org/abs/1998MNRAS.296..339N>`_) provides ~10% improvement in signal-to-noise ratio by using PSF-weighted photometry instead of simple aperture sums:
 
 .. code-block:: python
 
@@ -260,6 +290,63 @@ In crowded fields where source PSFs overlap, grouped optimal extraction simultan
    print('Sources in groups of 2+:', len(obj[obj['group_size'] > 1]))
 
 This adds ``group_id`` and ``group_size`` columns to identify which sources were fitted together.
+
+
+Noise model and correlated noise
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Flux errors are computed from a per-pixel noise map, defined by three arguments of :func:`stdpipe.photometry.measure_objects` (and :func:`stdpipe.photometry_measure.measure_objects_sep`):
+
+- ``err`` - the *full* per-pixel noise (background and objects), used as is. If not given, it is built from the background noise below plus, if ``gain`` is set, the Poisson noise of the background-subtracted image. ``gain`` is ignored when ``err`` is given, so a noise map that already includes the noise of the objects (e.g. the difference image noise model) is not counted twice.
+- ``bg_err`` - the background noise only, without the noise of the objects. If not given, the RMS map of the global background model is used.
+- ``gain`` - only used to add the Poisson noise of the objects to the automatically built noise map.
+
+Besides ``fluxerr``, the measurements include ``bg_fluxerr`` - the background noise summed inside the aperture, i.e. the flux error of a faint object at that position. It is computed from ``bg_err`` and does not depend on the brightness of the object itself, so it is suitable for estimating the local detection limit, e.g. ``-2.5*log10(5*bg_fluxerr)`` plus the zero point for S/N=5.
+
+These errors assume that the noise of different pixels is independent. It is not the case for images that were resampled (re-projected, aligned, stacked), convolved, or for difference images - the noise of neighbouring pixels gets correlated, and while the per-pixel noise does not grow (and is even reduced by the interpolation), the noise of sums over many pixels does. The flux errors and detection limits then come out too optimistic, often by a factor of 1.5-2 or more. :func:`stdpipe.photometry_background.estimate_noise_excess` measures this excess directly, as the robust scatter of the sums in apertures placed at random empty positions of the image, divided by the noise predicted for them from the noise map. It accepts the same ``aper``, ``fwhm``, ``optimal`` and ``psf`` arguments as the photometry routine, as the excess depends on the aperture size and weighting, and requires a mask covering all objects in the image (e.g. a dilated segmentation map):
+
+.. code-block:: python
+
+   from stdpipe import photometry_background
+   from scipy.ndimage import binary_dilation
+
+   # Background and its noise, e.g. from the detection step
+   bg, bg_rms = photometry_background.get_background(image, mask=mask, get_rms=True)
+
+   # Mask objects and their wings
+   omask = mask | binary_dilation(segm > 0, iterations=int(fwhm))
+
+   # Measure the noise excess with the same aperture as for the photometry
+   excess = photometry_background.estimate_noise_excess(
+       image, bg_rms, mask=omask, bg=bg, aper=1.0, fwhm=fwhm, verbose=True
+   )
+
+   # Scale the background noise - fluxerr and bg_fluxerr both follow it,
+   # gain still adds the noise of the objects
+   obj = photometry.measure_objects(obj, image, mask=mask, bg=bg, bg_err=excess*bg_rms,
+                fwhm=fwhm, aper=1.0, gain=gain, verbose=True)
+
+The excess is close to 1 for images with uncorrelated noise, so it is safe to always apply. It predicts the noise of aperture sums with squared pixel overlap weights, as photutils 3.1+ and sep-x 1.5.4+ do; photutils versions before 3.1 slightly overestimate the noise of the pixels on the aperture edge (by ~3% in the flux error for 5 pixels radius, ~6% for 3 pixels). As it only needs the mask and not the list of objects, it may be measured once and applied to all subsequent measurements on the same image, e.g. forced photometry of specific targets.
+
+The sums above use the global background only. If the photometry subtracts a local background from an annulus (``bkgann``), its actual noise differs: the noise of the local background estimate is added (by ~2% for the mean in a 5-7 FWHM annulus, but by ~13% for the default ``'mode'`` estimator, and much more for narrow annuli), while the background structure on scales larger than the annulus is removed. Only the former is accounted for in ``fluxerr``, and only as predicted from the noise map. In this case (and also for PSF fitting or other non-trivial measurements) pass the photometry routine itself as ``measure`` - it is then run on a grid of empty positions, and the excess is the robust scatter of its ``flux/fluxerr``:
+
+.. code-block:: python
+
+   # The same parameters for measuring the excess and for the photometry
+   kw = dict(mask=mask, bg=bg, fwhm=fwhm, aper=1.0, bkgann=[5, 7], bg_estimator='mode', sn=0)
+
+   excess = photometry_background.estimate_noise_excess(
+       image, mask=omask, aper=1.0, fwhm=fwhm,
+       measure=lambda o: photometry.measure_objects(o, image, bg_err=bg_rms, **kw),
+       verbose=True
+   )
+
+   obj = photometry.measure_objects(obj, image, bg_err=excess*bg_rms, gain=gain, **kw)
+
+The positions are placed on a grid with spacing larger than the grouping radius, so that grouped optimal extraction or PSF fitting treats them independently (see ``spacing`` argument), and should be measured without centroiding.
+
+.. autofunction:: stdpipe.photometry_background.estimate_noise_excess
+   :noindex:
 
 
 .. autofunction:: stdpipe.photometry.measure_objects

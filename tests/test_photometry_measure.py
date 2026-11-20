@@ -2523,6 +2523,309 @@ def _make_field(positions, total_fluxes, sigma=2.0, shape=(200, 200), noise=0.0,
 
 
 @pytest.mark.unit
+@pytest.mark.skipif(not photometry_measure._HAS_SEP_OPTIMAL, reason="Requires SEP 1.4+")
+class TestSEPNoiseMapSemantics:
+    """measure_objects_sep: err is the full noise, gain only builds it when err is None."""
+
+    flux = 1e5
+    noise = 5.0
+    aper = 4.5
+
+    @pytest.fixture
+    def star(self):
+        sigma = 2.0
+        rng = np.random.default_rng(1)
+        image = rng.normal(100.0, self.noise, (128, 128))
+        image += _create_pixel_integrated_gaussian(
+            128, 64, 64, self.flux / (2 * np.pi * sigma**2), sigma
+        )
+        return image, Table({'x': [64.0], 'y': [64.0]})
+
+    @pytest.mark.parametrize('mode', ['aperture', 'optimal', 'psf'])
+    def test_user_err_not_inflated_by_gain(self, star, mode):
+        image, obj = star
+        kw = dict(aper=self.aper, fwhm=2.0 * 2.355, bg=np.full_like(image, 100.0),
+                  err=np.full_like(image, self.noise), sn=0, verbose=False)
+        if mode == 'optimal':
+            kw['optimal'] = True
+        elif mode == 'psf':
+            if not _HAS_SEP_PSF:
+                pytest.skip("Requires SEP psf_fit()")
+            kw['psf'] = sep.PSF.from_gaussian(2.0 * 2.355)
+
+        r0 = photometry_measure.measure_objects_sep(obj, image, gain=None, **kw)
+        r1 = photometry_measure.measure_objects_sep(obj, image, gain=0.5, **kw)
+        assert r1['fluxerr'][0] == pytest.approx(r0['fluxerr'][0], rel=1e-6)
+
+    def test_no_gain_means_background_noise_only(self, star):
+        image, obj = star
+        res = photometry_measure.measure_objects_sep(
+            obj, image, aper=self.aper, gain=None, sn=0, verbose=False
+        )
+        expected = self.noise * np.sqrt(np.pi * self.aper**2)
+        assert res['fluxerr'][0] == pytest.approx(expected, rel=0.1)
+
+    def test_gain_adds_poisson_like_measure_objects(self, star):
+        image, obj = star
+        gain = 2.0
+        res = photometry_measure.measure_objects_sep(
+            obj, image, aper=self.aper, gain=gain, sn=0, verbose=False
+        )
+        ref = photometry_measure.measure_objects(
+            obj, image, aper=self.aper, gain=gain, sn=0, verbose=False
+        )
+        expected = np.sqrt(self.noise**2 * np.pi * self.aper**2 + self.flux / gain)
+        assert res['fluxerr'][0] == pytest.approx(expected, rel=0.1)
+        assert res['fluxerr'][0] == pytest.approx(ref['fluxerr'][0], rel=0.05)
+
+
+def _measure_backend(name):
+    if name == 'sep':
+        if not photometry_measure._HAS_SEP_OPTIMAL:
+            pytest.skip("Requires SEP 1.4+")
+        return photometry_measure.measure_objects_sep
+    return photometry_measure.measure_objects
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('backend', ['photutils', 'sep'])
+class TestBgErr:
+    """bg_err feeds bg_fluxerr and is the base of the automatic noise map."""
+
+    flux = 1e5
+    noise = 5.0
+    aper = 4.5
+
+    @pytest.fixture
+    def star(self):
+        sigma = 2.0
+        rng = np.random.default_rng(2)
+        image = rng.normal(100.0, self.noise, (128, 128))
+        image += _create_pixel_integrated_gaussian(
+            128, 64, 64, self.flux / (2 * np.pi * sigma**2), sigma
+        )
+        return image, Table({'x': [64.0], 'y': [64.0]})
+
+    def test_estimated_background_errors_match_total_without_gain(self, star, backend):
+        image, obj = star
+        res = _measure_backend(backend)(
+            obj, image, aper=self.aper, gain=None, sn=0, verbose=False,
+        )
+        np.testing.assert_allclose(res["bg_fluxerr"], res["fluxerr"], rtol=1e-6)
+
+    def test_bg_fluxerr_from_scalar_bg_err(self, star, backend):
+        image, obj = star
+        measure = _measure_backend(backend)
+        # bg and err given: previously bg_fluxerr was 0 here
+        res = measure(
+            obj, image, aper=self.aper, bg=np.full_like(image, 100.0),
+            err=np.full_like(image, self.noise), bg_err=3.0 * self.noise,
+            sn=0, verbose=False,
+        )
+        # err is used as is, bg_err does not affect fluxerr
+        ref = measure(
+            obj, image, aper=self.aper, bg=np.full_like(image, 100.0),
+            err=np.full_like(image, self.noise), sn=0, verbose=False,
+        )
+        assert res['fluxerr'][0] == pytest.approx(ref['fluxerr'][0], rel=1e-6)
+        assert res["bg_fluxerr"][0] == pytest.approx(3 * ref["fluxerr"][0], rel=1e-6)
+
+    def test_bg_err_is_base_of_automatic_noise(self, star, backend):
+        image, obj = star
+        measure = _measure_backend(backend)
+        gain, f = 2.0, 2.0
+        res = measure(
+            obj, image, aper=self.aper, bg_err=np.full_like(image, f * self.noise),
+            gain=gain, sn=0, verbose=False,
+        )
+        npix = np.pi * self.aper**2
+        ref = measure(obj, image, aper=self.aper, bg=100.0,
+                      err=np.full_like(image, f * self.noise), sn=0, verbose=False)
+        assert res["bg_fluxerr"][0] == pytest.approx(ref["fluxerr"][0], rel=0.02)
+        expected = np.sqrt(f**2 * self.noise**2 * npix + self.flux / gain)
+        assert res['fluxerr'][0] == pytest.approx(expected, rel=0.05)
+
+    def test_non_finite_bg_err_pixels_ignored(self, star, backend):
+        image, obj = star
+        measure = _measure_backend(backend)
+        bg_err = np.full_like(image, self.noise)
+        bg_err[64, 64] = np.nan
+        res = measure(
+            obj, image, aper=self.aper, err=np.full_like(image, self.noise),
+            bg_err=bg_err, sn=0, verbose=False,
+        )
+        assert np.isfinite(res['bg_fluxerr'][0])
+        ref = measure(obj, image, aper=self.aper, bg=0.0,
+                      err=np.where(np.isfinite(bg_err), bg_err, 0.0), sn=0, verbose=False)
+        assert res["bg_fluxerr"][0] == pytest.approx(ref["fluxerr"][0], rel=0.01)
+
+    def test_bg_err_shape_mismatch(self, star, backend):
+        image, obj = star
+        measure = _measure_backend(backend)
+        with pytest.raises(ValueError, match='bg_err shape'):
+            measure(obj, image, bg_err=np.ones((10, 10)), verbose=False)
+
+
+@pytest.fixture(scope='module')
+def empty_sky_grid():
+    """White noise of unit RMS with a grid of isolated empty positions."""
+    rng = np.random.default_rng(3)
+    n = 1800
+    image = rng.normal(0, 1.0, (n, n))
+    g = np.arange(60, n - 60, 45.0)
+    x, y = [_.ravel() for _ in np.meshgrid(g, g)]
+    obj = Table({'x': x + rng.uniform(-0.5, 0.5, x.size), 'y': y + rng.uniform(-0.5, 0.5, x.size)})
+    return image, obj
+
+
+@pytest.mark.unit
+class TestLocalBackgroundNoise:
+    """fluxerr includes the noise of the local background estimated in the annulus."""
+
+    def test_estimator_noise_factors(self):
+        """Relative noise of the median and mode estimators of the mean of Gaussian noise."""
+        from astropy.stats import sigma_clipped_stats
+
+        rng = np.random.default_rng(0)
+        data = rng.normal(0, 1, (4000, 500))
+        mean, med = np.mean(data, axis=1), np.median(data, axis=1)
+        k = photometry_measure._LOCAL_BG_ESTIMATOR_NOISE
+        assert np.std(med) / np.std(mean) == pytest.approx(k['median'], rel=0.05)
+        assert np.std(3 * med - 2 * mean) / np.std(mean) == pytest.approx(k['mode'], rel=0.05)
+
+    def test_order_factor(self):
+        # Constant and plane fits on a symmetric annulus are as good as the mean
+        assert photometry_measure._local_bg_order_factor(8, 12, 0) == 1.0
+        assert photometry_measure._local_bg_order_factor(8, 12, 1) == pytest.approx(1.0, abs=0.02)
+        # Quadratic terms are degenerate with the constant over a thin annulus
+        assert photometry_measure._local_bg_order_factor(8, 12, 2) > 1.5
+
+    @pytest.mark.parametrize('backend', ['photutils', 'sep'])
+    @pytest.mark.parametrize('optimal', [False, True])
+    @pytest.mark.parametrize('bg_estimator', ['median', 'mode'])
+    def test_pulls(self, empty_sky_grid, backend, optimal, bg_estimator):
+        from astropy.stats import mad_std
+
+        image, obj = empty_sky_grid
+        measure = _measure_backend(backend)
+        kw = dict(aper=1.0, fwhm=4.0, optimal=optimal, bg=0.0, bg_err=1.0, sn=0, verbose=False)
+
+        ref = measure(obj, image, **kw)
+        res = measure(obj, image, bkgann=(2, 3), bg_estimator=bg_estimator, **kw)
+
+        # Noise of the narrow annulus estimate is significant, but now accounted for.
+        # Without it, the scatter of the pulls was up to 1.5 for the mode.
+        assert np.median(res['bg_local_err']) > 0
+        assert np.median(res['fluxerr'] / ref['fluxerr']) > 1.05
+        assert mad_std(res['flux'] / res['fluxerr']) == pytest.approx(1.0, abs=0.07)
+
+        # ..and in the background noise inside the aperture, the same for empty sky
+        assert np.allclose(res['bg_fluxerr'], res['fluxerr'], rtol=0.02) or optimal
+
+    def test_bkg_order(self, empty_sky_grid):
+        from astropy.stats import mad_std
+
+        image, obj = empty_sky_grid
+        for order in [1, 2]:
+            res = photometry_measure.measure_objects(
+                obj, image, aper=1.0, fwhm=4.0, bkgann=(2, 3), bkg_order=order,
+                bg_estimator='mean', bg=0.0, bg_err=1.0, sn=0, verbose=False,
+            )
+            assert mad_std(res['flux'] / res['fluxerr']) == pytest.approx(1.0, abs=0.07)
+
+    def test_groups_fitting_background_have_no_term(self):
+        """Grouped optimal extraction fits its own background, so the annulus noise
+        does not enter the fluxes of the group members."""
+        image = np.random.default_rng(1).normal(0, 1.0, (100, 100))
+        obj = Table({'x': [50.0, 53.0, 20.0], 'y': [50.0, 50.0, 20.0]})
+        kw = dict(aper=1.0, fwhm=3.0, optimal=True, bg=0.0, bg_err=1.0, sn=0, verbose=False,
+                  bkgann=(3, 5), bg_estimator='mode')
+        res = photometry_measure.measure_objects(obj, image, **kw)
+        ref = photometry_measure.measure_objects(obj, image, **(kw | {'bkgann': None}))
+        assert list(res['group_size']) == [2, 2, 1]
+        assert np.all(res['bg_local_err'] > 0)
+        # Isolated source gets the term, group members do not
+        assert res['fluxerr'][2] > 1.05 * ref['fluxerr'][2]
+
+
+@pytest.mark.unit
+class TestMaskedApertureFlag:
+    """0x200 is set only when masked pixels take a significant part of the flux."""
+
+    @pytest.fixture
+    def star(self):
+        rng = np.random.default_rng(2)
+        yy, xx = np.mgrid[:101, :101]
+        sigma = 4.0/2.3548
+        image = 1e4/(2*np.pi*sigma**2)*np.exp(-((xx - 50)**2 + (yy - 50)**2)/2/sigma**2)
+        image += rng.normal(0, 1.0, image.shape)
+        return image, Table({'x': [50.0], 'y': [50.0]})
+
+    @pytest.mark.parametrize('backend', ['photutils', 'sep'])
+    @pytest.mark.parametrize('pixel,max_fraction,flagged', [
+        (None, 0.01, False),
+        ((50, 57), 0.01, False),   # Single masked pixel in the wing, ~2 FWHM out
+        ((50, 50), 0.01, True),    # Masked core
+        ((50, 57), 0.0, True),     # Any masked pixel, as before
+    ])
+    def test_masked_pixel(self, star, backend, pixel, max_fraction, flagged):
+        image, obj = star
+        mask = np.zeros(image.shape, dtype=bool)
+        if pixel is not None:
+            mask[pixel] = True
+        res = _measure_backend(backend)(
+            obj, image, aper=2.0, fwhm=4.0, mask=mask, bg=0.0, err=np.ones_like(image),
+            max_masked_fraction=max_fraction, sn=0, verbose=False,
+        )
+        assert bool(res['flags'][0] & 0x200) == flagged
+
+    def test_masked_flux_fraction(self):
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[25, 25] = True
+        # Unweighted: one pixel of the aperture area
+        frac = photometry_measure._masked_flux_fraction(mask, [25.0], [25.0], 5.0)
+        assert frac[0] == pytest.approx(1/np.sum(np.hypot(*np.mgrid[-5:6, -5:6]) <= 5))
+        # PSF-weighted: central pixel weight of a narrow Gaussian dominates
+        frac = photometry_measure._masked_flux_fraction(mask, [25.0], [25.0], 5.0, fwhm=1.0)
+        assert frac[0] > 0.5
+
+
+@pytest.mark.unit
+class TestQuantizedLocalBackground:
+    """Median and mode of the annulus must not be quantized with integer-valued images."""
+
+    def test_quantization_step(self):
+        rng = np.random.default_rng(0)
+        base = 100.25 + 2 * rng.normal(size=(200, 200))
+        assert photometry_measure._quantization_step(np.round(base)) == 1.0
+        assert photometry_measure._quantization_step(np.round(base).astype(np.float32)) == 1.0
+        assert photometry_measure._quantization_step(0.7 * np.round(base / 0.7)) == pytest.approx(0.7)
+        assert photometry_measure._quantization_step(base) is None
+
+    def test_grouped_median(self):
+        """Interpolated median follows the level between the grid values, unlike the plain one."""
+        rng = np.random.default_rng(1)
+        for off in [0.0, 0.25, 0.5, 0.75]:
+            values = np.round(off + 2 * rng.normal(size=100000))
+            assert np.median(values) in (0.0, 1.0)
+            assert photometry_measure._grouped_median(values, 1.0) == pytest.approx(off, abs=0.02)
+
+    @pytest.mark.parametrize('backend', ['photutils', 'sep'])
+    @pytest.mark.parametrize('bg_estimator', ['median', 'mode'])
+    def test_empty_sky_unbiased(self, backend, bg_estimator):
+        # Sky level a quarter step above an integer: the plain median was biased by
+        # 1.1 sigma, and the mode by 2.7 sigma, of the aperture noise
+        rng = np.random.default_rng(1)
+        image = np.round(100.25 + 2 * rng.normal(size=(1024, 1024)))
+        obj = Table({'x': rng.uniform(30, 994, 2000), 'y': rng.uniform(30, 994, 2000)})
+        res = _measure_backend(backend)(
+            obj, image, aper=5.6, bkgann=[15, 21], bg_estimator=bg_estimator,
+            bg_size=128, gain=1e9, verbose=False,
+        )
+        assert np.nanmedian(res['flux'] / res['fluxerr']) == pytest.approx(0, abs=0.15)
+
+
+@pytest.mark.unit
 class TestSEPPSFSampledModel:
     """SEP PSF fitting should follow the declared sampling convention of the model."""
 

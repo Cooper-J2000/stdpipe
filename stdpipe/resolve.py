@@ -7,9 +7,29 @@ import io
 from astropy.coordinates import SkyCoord
 
 
+# Sesame servers tried, in order, when the previous one fails with a network error
+sesame_mirrors = [
+    'https://cds.unistra.fr/cgi-bin/nph-sesame',
+    'https://vizier.cfa.harvard.edu/viz-bin/nph-sesame',
+    'https://vizier.idia.ac.za/viz-bin/nph-sesame',
+]
+
+
 def simbadResolve(name='m31'):
-    url = 'http://cdsweb.u-strasbg.fr/viz-bin/nph-sesame/-oxpi/SNVA'
-    res = requests.get(url, params=requests.utils.quote(name))
+    # Query Simbad only - NED and VizieR are slow on misses, and are anyway
+    # covered by SkyCoord.from_name() fallback in resolve()
+    for server in sesame_mirrors:
+        try:
+            res = requests.get(
+                server + '/-oxpi/S', params=requests.utils.quote(name), timeout=30
+            )
+            res.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            # Network-level failure or HTTP error - try the next server
+            error = e
+    else:
+        raise error
 
     try:
         xml = minidom.parseString(res.content)
@@ -51,7 +71,9 @@ def tnsResolve(name='AT2023lxx'):
         if reverse:
             params.update({'reverse': True})
 
-        r = requests.post("https://api.ztf.fink-portal.org/api/v1/resolver", json=params)
+        r = requests.post(
+            "https://api.ztf.fink-portal.org/api/v1/resolver", json=params, timeout=30
+        )
 
         res = json.loads(r.content)
         if res:
@@ -237,7 +259,11 @@ def resolve(string='M33', verbose=False):
             target = SkyCoord(ra, dec, unit='deg')
 
     if target is None:
-        name, ra, dec = simbadResolve(string)
+        try:
+            name, ra, dec = simbadResolve(string)
+        except Exception as e:
+            log("Simbad resolution failed:", e)
+            name = None
 
         if name:
             log("Resolved by Simbad as", name)
@@ -245,7 +271,11 @@ def resolve(string='M33', verbose=False):
             target = SkyCoord(ra, dec, unit='deg')
 
     if target is None:
-        name, ra, dec = tnsResolve(string)
+        try:
+            name, ra, dec = tnsResolve(string)
+        except Exception as e:
+            log("TNS resolution failed:", e)
+            name = None
 
         if name:
             log("Resolved by TNS as", name)

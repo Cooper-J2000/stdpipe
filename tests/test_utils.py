@@ -271,6 +271,17 @@ class TestFITSUtilities:
     """Test FITS header parsing and utilities."""
 
     @pytest.mark.unit
+    def test_get_obs_time_prefers_date_mid(self):
+        header = {
+            'DATE-MID': '2026-11-20T12:00:00',
+            'DATE-OBS': '2026-11-20T11:59:00',
+        }
+
+        time = utils.get_obs_time(header=header)
+
+        assert time.isot == '2026-11-20T12:00:00.000'
+
+    @pytest.mark.unit
     def test_parse_det_basic(self):
         """Test parsing DATASEC/TRIMSEC strings."""
         # FITS DATASEC format: [x1:x2,y1:y2]

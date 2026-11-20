@@ -29,16 +29,13 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Astronomy",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 
 # Core dependencies
 dependencies = [
@@ -47,7 +44,7 @@ dependencies = [
     "astropy>=4.1",
     "matplotlib",
     "astroquery>0.4.1",
-    "sep-x",
+    "sep-x>=1.5.4",
     "astroscrappy",
     "photutils>=2.2",
     "scikit-image>=0.22.0",  # Requires >=0.22.0 for NumPy 2.0 compatibility
@@ -103,7 +100,7 @@ Homepage = "https://github.com/karpov-sv/stdpipe"
 Documentation = "https://stdpipe.readthedocs.io/"
 Repository = "https://github.com/karpov-sv/stdpipe"
 "Bug Tracker" = "https://github.com/karpov-sv/stdpipe/issues"
-Changelog = "https://github.com/karpov-sv/stdpipe/commits/master"
+Changelog = "https://github.com/karpov-sv/stdpipe/blob/master/CHANGELOG.md"
 
 # ============================================================================
 # Tool configurations
